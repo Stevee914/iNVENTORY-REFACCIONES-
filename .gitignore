@@ -1,0 +1,24 @@
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Variables sensibles
+.env
+
+# Cachés de Python
+__pycache__/
+*.py[cod]
+*.class
+
+# Historial y temporales
+.history/
+*.log
+*.tmp
+
+# VS Code
+.vscode/
+
+# Sistema
+.DS_Store
+Thumbs.db
