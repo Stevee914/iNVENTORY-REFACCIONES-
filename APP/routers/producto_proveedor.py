@@ -29,7 +29,8 @@ def list_mappings(
         text(f"""
             SELECT pp.id, pp.proveedor_id, pv.nombre as proveedor_nombre,
                    pp.product_id, p.sku, p.name as product_name,
-                   pp.supplier_sku, pp.descripcion_proveedor, pp.is_primary, pp.created_at
+                   pp.supplier_sku, pp.descripcion_proveedor, pp.is_primary,
+                   pp.precio_proveedor, pp.created_at
             FROM producto_proveedor pp
             JOIN proveedores pv ON pv.id = pp.proveedor_id
             JOIN productos p ON p.id = pp.product_id
@@ -43,7 +44,6 @@ def list_mappings(
 
 @router.post("")
 def create_mapping(payload: ProductoProveedorCreate, db: Session = Depends(get_db)):
-    # Validar proveedor
     prov = db.execute(
         text("SELECT id FROM proveedores WHERE id = :id"),
         {"id": payload.proveedor_id},
@@ -51,7 +51,6 @@ def create_mapping(payload: ProductoProveedorCreate, db: Session = Depends(get_d
     if not prov:
         raise HTTPException(status_code=404, detail=f"Proveedor no existe: {payload.proveedor_id}")
 
-    # Validar producto
     prod = db.execute(
         text("SELECT id FROM productos WHERE id = :id"),
         {"id": payload.product_id},
@@ -67,10 +66,10 @@ def create_mapping(payload: ProductoProveedorCreate, db: Session = Depends(get_d
         row = db.execute(
             text("""
                 INSERT INTO producto_proveedor
-                    (proveedor_id, product_id, supplier_sku, descripcion_proveedor, is_primary)
+                    (proveedor_id, product_id, supplier_sku, descripcion_proveedor, is_primary, precio_proveedor)
                 VALUES
-                    (:prov_id, :prod_id, :sup_sku, :desc, :is_primary)
-                RETURNING id, proveedor_id, product_id, supplier_sku, descripcion_proveedor, is_primary, created_at
+                    (:prov_id, :prod_id, :sup_sku, :desc, :is_primary, :precio)
+                RETURNING id, proveedor_id, product_id, supplier_sku, descripcion_proveedor, is_primary, precio_proveedor, created_at
             """),
             {
                 "prov_id": payload.proveedor_id,
@@ -78,6 +77,7 @@ def create_mapping(payload: ProductoProveedorCreate, db: Session = Depends(get_d
                 "sup_sku": supplier_sku,
                 "desc": payload.descripcion_proveedor,
                 "is_primary": payload.is_primary,
+                "precio": payload.precio_proveedor,
             },
         ).mappings().one()
         db.commit()
@@ -111,6 +111,9 @@ def update_mapping(mapping_id: int, payload: ProductoProveedorUpdate, db: Sessio
     if payload.is_primary is not None:
         updates.append("is_primary = :is_primary")
         params["is_primary"] = payload.is_primary
+    if payload.precio_proveedor is not None:
+        updates.append("precio_proveedor = :precio")
+        params["precio"] = payload.precio_proveedor
 
     if not updates:
         raise HTTPException(status_code=400, detail="No se enviaron campos")
@@ -119,7 +122,7 @@ def update_mapping(mapping_id: int, payload: ProductoProveedorUpdate, db: Sessio
         text(f"""
             UPDATE producto_proveedor SET {", ".join(updates)}
             WHERE id = :id
-            RETURNING id, proveedor_id, product_id, supplier_sku, descripcion_proveedor, is_primary
+            RETURNING id, proveedor_id, product_id, supplier_sku, descripcion_proveedor, is_primary, precio_proveedor
         """),
         params,
     ).mappings().one()

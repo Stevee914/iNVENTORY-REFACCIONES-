@@ -14,7 +14,7 @@ def list_stock(
     only_negative: bool = Query(default=False, description="Solo productos con stock físico < 0"),
     below_min_stock: bool = Query(default=False, description="Solo productos con stock físico < min_stock"),
     page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=50, ge=1, le=10000),
+    page_size: int = Query(default=50, ge=1, le=100000),
 ):
     where = []
     params: dict = {}

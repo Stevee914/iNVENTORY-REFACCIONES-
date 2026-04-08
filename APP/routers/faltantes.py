@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from APP.db import get_db
-from APP.schemas_faltantes import FaltanteCreate, FaltanteUpdateStatus
+from APP.schemas_faltantes import FaltanteCreate, FaltanteUpdate
 
 router = APIRouter(prefix="/faltantes", tags=["Faltantes"])
 
@@ -14,7 +14,6 @@ def create_faltante(payload: FaltanteCreate, db: Session = Depends(get_db)):
     if payload.cantidad_faltante <= 0:
         raise HTTPException(status_code=400, detail="cantidad_faltante debe ser mayor a 0")
 
-    # Verificar producto existe
     prod = db.execute(
         text("SELECT id, sku, name FROM productos WHERE id = :id"),
         {"id": payload.product_id},
@@ -77,10 +76,7 @@ def list_faltantes(
 
 
 @router.patch("/{faltante_id}")
-def update_faltante_status(faltante_id: int, payload: FaltanteUpdateStatus, db: Session = Depends(get_db)):
-    if payload.status not in VALID_STATUS:
-        raise HTTPException(status_code=400, detail=f"status debe ser: {', '.join(VALID_STATUS)}")
-
+def update_faltante(faltante_id: int, payload: FaltanteUpdate, db: Session = Depends(get_db)):
     existing = db.execute(
         text("SELECT id FROM faltantes WHERE id = :id"),
         {"id": faltante_id},
@@ -88,13 +84,41 @@ def update_faltante_status(faltante_id: int, payload: FaltanteUpdateStatus, db: 
     if not existing:
         raise HTTPException(status_code=404, detail="Faltante no encontrado")
 
+    updates: list[str] = []
+    params: dict = {"id": faltante_id}
+
+    if payload.status is not None:
+        if payload.status not in VALID_STATUS:
+            raise HTTPException(status_code=400, detail=f"status debe ser: {', '.join(VALID_STATUS)}")
+        updates.append("status = :status")
+        params["status"] = payload.status
+
+    if payload.product_id is not None:
+        if not db.execute(text("SELECT 1 FROM productos WHERE id = :pid"), {"pid": payload.product_id}).scalar():
+            raise HTTPException(status_code=404, detail=f"Producto no existe: {payload.product_id}")
+        updates.append("product_id = :product_id")
+        params["product_id"] = payload.product_id
+
+    if payload.cantidad_faltante is not None:
+        if payload.cantidad_faltante <= 0:
+            raise HTTPException(status_code=400, detail="cantidad_faltante debe ser mayor a 0")
+        updates.append("cantidad_faltante = :cantidad_faltante")
+        params["cantidad_faltante"] = payload.cantidad_faltante
+
+    if payload.comentario is not None:
+        updates.append("comentario = :comentario")
+        params["comentario"] = payload.comentario or None
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No se enviaron campos para actualizar")
+
     row = db.execute(
-        text("""
-            UPDATE faltantes SET status = :status
+        text(f"""
+            UPDATE faltantes SET {', '.join(updates)}
             WHERE id = :id
             RETURNING id, product_id, cantidad_faltante, comentario, fecha_detectado, status
         """),
-        {"id": faltante_id, "status": payload.status},
+        params,
     ).mappings().one()
     db.commit()
     return {"ok": True, "faltante": dict(row)}
@@ -119,9 +143,10 @@ def faltantes_por_proveedor(db: Session = Depends(get_db)):
     """Agrupa faltantes pendientes por proveedor sugerido."""
     rows = db.execute(
         text("""
-            SELECT f.id, f.product_id, p.sku, p.name as product_name, p.marca,
+            SELECT f.id, f.product_id, p.sku, p.name as product_name, p.marca, p.unit,
                    f.cantidad_faltante, f.comentario, f.fecha_detectado,
-                   pv.id as proveedor_id, COALESCE(pv.nombre, 'Sin proveedor') as proveedor_nombre
+                   pv.id as proveedor_id, COALESCE(pv.nombre, 'Sin proveedor') as proveedor_nombre,
+                   pp.supplier_sku, pp.precio_proveedor
             FROM faltantes f
             JOIN productos p ON p.id = f.product_id
             LEFT JOIN producto_proveedor pp ON pp.product_id = p.id AND pp.is_primary = true
@@ -131,7 +156,6 @@ def faltantes_por_proveedor(db: Session = Depends(get_db)):
         """),
     ).mappings().all()
 
-    # Agrupar por proveedor
     grupos = {}
     for r in rows:
         key = r["proveedor_nombre"]
@@ -148,9 +172,12 @@ def faltantes_por_proveedor(db: Session = Depends(get_db)):
             "sku": r["sku"],
             "product_name": r["product_name"],
             "marca": r["marca"],
+            "unit": r["unit"],
             "cantidad_faltante": r["cantidad_faltante"],
             "comentario": r["comentario"],
             "fecha_detectado": r["fecha_detectado"],
+            "supplier_sku": r["supplier_sku"],
+            "precio_proveedor": float(r["precio_proveedor"]) if r["precio_proveedor"] else None,
         })
         grupos[key]["total_items"] += 1
 

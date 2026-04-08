@@ -58,6 +58,7 @@ def normalize_unit(value: str) -> str:
     unit_map = {
         "PIEZA": "PZA", "PZA": "PZA", "PAR": "PAR",
         "JUEGO": "JGO", "JGO": "JGO", "KIT": "KIT",
+        "CAJA": "CAJA", "CJA": "CAJA",
     }
     return unit_map.get(unit, unit or "PZA")
 

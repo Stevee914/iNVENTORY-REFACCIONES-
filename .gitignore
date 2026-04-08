@@ -6,7 +6,7 @@ env/
 # Variables sensibles
 .env
 
-# Cachés de Python
+# Cachï¿½s de Python
 __pycache__/
 *.py[cod]
 *.class
@@ -23,3 +23,9 @@ __pycache__/
 .DS_Store
 Thumbs.db
 test.py
+
+# Claude AI memory
+.claude/
+
+# One-off data enrichment scripts (not production code)
+APP/scripts/

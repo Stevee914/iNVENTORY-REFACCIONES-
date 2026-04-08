@@ -21,20 +21,40 @@ def list_categorias(db: Session = Depends(get_db)):
 
 @router.get("/tree")
 def categorias_tree(db: Session = Depends(get_db)):
-    """Devuelve categorías en formato árbol (padres con sus hijos)."""
+    """Devuelve categorías en formato árbol recursivo con conteo acumulado de productos."""
     rows = db.execute(text("""
-        SELECT id, name, description, parent_id
-        FROM categoria
-        ORDER BY name
+        WITH RECURSIVE descendants AS (
+            SELECT id AS root_id, id AS desc_id FROM categoria
+            UNION ALL
+            SELECT d.root_id, c.id
+            FROM descendants d
+            JOIN categoria c ON c.parent_id = d.desc_id
+        ),
+        recursive_counts AS (
+            SELECT d.root_id, COUNT(p.id) AS total_productos
+            FROM descendants d
+            LEFT JOIN productos p ON p.categoria_id = d.desc_id
+            GROUP BY d.root_id
+        )
+        SELECT c.id, c.name, c.description, c.parent_id,
+               COALESCE(rc.total_productos, 0) AS total_productos
+        FROM categoria c
+        LEFT JOIN recursive_counts rc ON rc.root_id = c.id
+        ORDER BY c.name
     """)).mappings().all()
 
-    parents = [dict(r) for r in rows if r["parent_id"] is None]
-    children = [dict(r) for r in rows if r["parent_id"] is not None]
+    by_id = {r["id"]: {**dict(r), "subcategorias": []} for r in rows}
 
-    for parent in parents:
-        parent["subcategorias"] = [c for c in children if c["parent_id"] == parent["id"]]
+    roots = []
+    for node in by_id.values():
+        if node["parent_id"] is None:
+            roots.append(node)
+        else:
+            parent = by_id.get(node["parent_id"])
+            if parent:
+                parent["subcategorias"].append(node)
 
-    return parents
+    return roots
 
 
 @router.get("/{categoria_id}")

@@ -1,6 +1,6 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, date
 from enum import Enum
 
 
@@ -35,10 +35,12 @@ class ProductCreate(BaseModel):
     unit: str = "PZA"
     min_stock: float = 0.0
     price: float = 0.0
+    precio_publico: Optional[float] = None
     is_active: bool = True
     aplicacion: Optional[str] = None
     ubicacion: Optional[str] = None
     descripcion_larga: Optional[str] = None
+    medida: Optional[str] = None
     anio_inicio: Optional[int] = None
     anio_fin: Optional[int] = None
     dim_largo: Optional[float] = None
@@ -54,12 +56,14 @@ class ProductUpdate(BaseModel):
     min_stock: Optional[float] = None
     is_active: Optional[bool] = None
     price: Optional[float] = None
+    precio_publico: Optional[float] = None
     codigo_cat: Optional[str] = None
     codigo_pos: Optional[str] = None
     marca: Optional[str] = None
     aplicacion: Optional[str] = None
     ubicacion: Optional[str] = None
     descripcion_larga: Optional[str] = None
+    medida: Optional[str] = None
     anio_inicio: Optional[int] = None
     anio_fin: Optional[int] = None
     dim_largo: Optional[float] = None
@@ -106,12 +110,13 @@ class ProductoProveedorCreate(BaseModel):
     supplier_sku: str
     descripcion_proveedor: Optional[str] = None
     is_primary: bool = False
+    precio_proveedor: Optional[float] = None
 
 class ProductoProveedorUpdate(BaseModel):
     supplier_sku: Optional[str] = None
     descripcion_proveedor: Optional[str] = None
     is_primary: Optional[bool] = None
-
+    precio_proveedor: Optional[float] = None
 
 # --- Categorias ---
 
