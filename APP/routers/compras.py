@@ -9,8 +9,10 @@ from datetime import date
 
 router = APIRouter(prefix="/compras", tags=["Compras"])
 
-ESTATUS_VALIDOS     = ("PENDIENTE", "RECIBIDA", "PAGADA", "PARCIAL", "CANCELADA")
-TIPO_COMPRA_VALIDOS = ("CON_FACTURA", "SIN_FACTURA")
+ESTATUS_VALIDOS           = ("PENDIENTE", "RECIBIDA", "PAGADA", "PARCIAL", "CANCELADA")
+TIPO_COMPRA_VALIDOS       = ("CON_FACTURA", "SIN_FACTURA")
+ESTATUS_RECEPCION_VALIDOS = {"PENDIENTE", "PARCIAL", "RECIBIDA"}
+ESTATUS_WORKFLOW_VALIDOS  = {"REVIEW", "READY", "IMPORTED"}
 
 # metodo_pago intentionally stores both payment instruments (EFECTIVO, TRANSFERENCIA…)
 # and payment conditions (CONTADO, CREDITO) from the POS.  These are semantically
@@ -50,8 +52,11 @@ class CompraCreate(BaseModel):
     estatus:       str = "PENDIENTE"
     metodo_pago:   Optional[str] = None
     notas:         Optional[str] = None
-    tipo_compra:   str = "SIN_FACTURA"
-    detalle:       List[DetalleItem] = []
+    tipo_compra:       str = "SIN_FACTURA"
+    estatus_recepcion: str = "PENDIENTE"
+    estatus_workflow:  str | None = None
+    uuid_fiscal:       str | None = None
+    detalle:           List[DetalleItem] = []
 
     @field_validator("fecha")
     @classmethod
@@ -72,9 +77,11 @@ class CompraUpdate(BaseModel):
     iva:           Optional[float] = None
     total:         Optional[float] = None
     estatus:       Optional[str]   = None
-    metodo_pago:   Optional[str]   = None
-    notas:         Optional[str]   = None
-    tipo_compra:   Optional[str]   = None
+    metodo_pago:       Optional[str]   = None
+    notas:             Optional[str]   = None
+    tipo_compra:       Optional[str]   = None
+    estatus_recepcion: Optional[str]   = None
+    estatus_workflow:  Optional[str]   = None
 
 
 class CompraFromFaltantes(BaseModel):
@@ -94,6 +101,7 @@ _SELECT = """
         c.subtotal, c.iva, c.total,
         c.estatus, c.metodo_pago, c.notas,
         c.origen, c.tipo_compra, c.pos_compra_id,
+        c.estatus_recepcion, c.estatus_workflow, c.uuid_fiscal,
         c.created_at,
         p.id           AS proveedor_id,
         p.nombre       AS proveedor_nombre,
@@ -473,6 +481,17 @@ def create_compra(payload: CompraCreate, db: Session = Depends(get_db)):
     if estatus not in ESTATUS_VALIDOS:
         raise HTTPException(status_code=400, detail=f"Estatus inválido. Válidos: {ESTATUS_VALIDOS}")
 
+    estatus_recepcion = payload.estatus_recepcion.upper()
+    if estatus_recepcion not in ESTATUS_RECEPCION_VALIDOS:
+        raise HTTPException(status_code=400, detail=f"estatus_recepcion inválido: {estatus_recepcion}. Válidos: {ESTATUS_RECEPCION_VALIDOS}")
+
+    if payload.estatus_workflow is not None:
+        estatus_workflow = payload.estatus_workflow.upper()
+        if estatus_workflow not in ESTATUS_WORKFLOW_VALIDOS:
+            raise HTTPException(status_code=400, detail=f"estatus_workflow inválido: {estatus_workflow}. Válidos: {ESTATUS_WORKFLOW_VALIDOS}")
+    else:
+        estatus_workflow = None
+
     tipo = payload.tipo_compra.upper()
     if tipo not in TIPO_COMPRA_VALIDOS:
         raise HTTPException(status_code=400, detail=f"tipo_compra inválido. Válidos: {TIPO_COMPRA_VALIDOS}")
@@ -508,25 +527,30 @@ def create_compra(payload: CompraCreate, db: Session = Depends(get_db)):
                 (proveedor_id, folio_factura, folio_captura,
                  fecha, subtotal, iva, total,
                  estatus, metodo_pago, notas,
-                 origen, tipo_compra)
+                 origen, tipo_compra,
+                 estatus_recepcion, estatus_workflow, uuid_fiscal)
             VALUES
                 (:proveedor_id, :folio_factura, :folio_captura,
                  :fecha, :subtotal, :iva, :total,
                  :estatus, :metodo_pago, :notas,
-                 'MANUAL', :tipo_compra)
+                 'MANUAL', :tipo_compra,
+                 :estatus_recepcion, :estatus_workflow, :uuid_fiscal)
             RETURNING id
         """), {
-            "proveedor_id":  payload.proveedor_id,
-            "folio_factura": normalize_text(payload.folio_factura).upper() if payload.folio_factura else None,
-            "folio_captura": normalize_text(payload.folio_captura).upper() if payload.folio_captura else None,
-            "fecha":         payload.fecha,
-            "subtotal":      payload.subtotal,
-            "iva":           payload.iva,
-            "total":         payload.total,
-            "estatus":       estatus,
-            "metodo_pago":   metodo,
-            "notas":         payload.notas,
-            "tipo_compra":   tipo,
+            "proveedor_id":      payload.proveedor_id,
+            "folio_factura":     normalize_text(payload.folio_factura).upper() if payload.folio_factura else None,
+            "folio_captura":     normalize_text(payload.folio_captura).upper() if payload.folio_captura else None,
+            "fecha":             payload.fecha,
+            "subtotal":          payload.subtotal,
+            "iva":               payload.iva,
+            "total":             payload.total,
+            "estatus":           estatus,
+            "metodo_pago":       metodo,
+            "notas":             payload.notas,
+            "tipo_compra":       tipo,
+            "estatus_recepcion": estatus_recepcion,
+            "estatus_workflow":  estatus_workflow,
+            "uuid_fiscal":       payload.uuid_fiscal,
         }).scalar()
 
         for item in payload.detalle:
@@ -629,9 +653,11 @@ def crear_compra_desde_faltantes(payload: CompraFromFaltantes, db: Session = Dep
     try:
         compra = db.execute(text("""
             INSERT INTO compras
-                (proveedor_id, estatus, origen, tipo_compra, notas, fecha, subtotal, iva, total, created_at, updated_at)
+                (proveedor_id, estatus, origen, tipo_compra, notas, fecha, subtotal, iva, total,
+                 estatus_recepcion, estatus_workflow, created_at, updated_at)
             VALUES
-                (:proveedor_id, 'PENDIENTE', 'MANUAL', 'SIN_FACTURA', :notas, CURRENT_DATE, 0, 0, 0, NOW(), NOW())
+                (:proveedor_id, 'PENDIENTE', 'MANUAL', 'SIN_FACTURA', :notas, CURRENT_DATE, 0, 0, 0,
+                 'PENDIENTE', NULL, NOW(), NOW())
             RETURNING id, fecha, estatus
         """), {
             "proveedor_id": payload.proveedor_id,
@@ -713,6 +739,16 @@ def update_compra(compra_id: int, payload: CompraUpdate, db: Session = Depends(g
         if tipo not in TIPO_COMPRA_VALIDOS:
             raise HTTPException(status_code=400, detail=f"tipo_compra inválido. Válidos: {TIPO_COMPRA_VALIDOS}")
         updates.append("tipo_compra = :tipo_compra"); params["tipo_compra"] = tipo
+    if payload.estatus_recepcion is not None:
+        er = payload.estatus_recepcion.upper()
+        if er not in ESTATUS_RECEPCION_VALIDOS:
+            raise HTTPException(status_code=400, detail=f"estatus_recepcion inválido: {er}. Válidos: {ESTATUS_RECEPCION_VALIDOS}")
+        updates.append("estatus_recepcion = :estatus_recepcion"); params["estatus_recepcion"] = er
+    if payload.estatus_workflow is not None:
+        ew = payload.estatus_workflow.upper()
+        if ew not in ESTATUS_WORKFLOW_VALIDOS:
+            raise HTTPException(status_code=400, detail=f"estatus_workflow inválido: {ew}. Válidos: {ESTATUS_WORKFLOW_VALIDOS}")
+        updates.append("estatus_workflow = :estatus_workflow"); params["estatus_workflow"] = ew
 
     if not updates:
         raise HTTPException(status_code=400, detail="No se enviaron campos para actualizar")
