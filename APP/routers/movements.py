@@ -1,9 +1,13 @@
+import logging
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from APP.db import get_db
 from APP.schemas import MovementCreate
 from APP.helpers import normalize_sku, normalize_text, normalize_quantity, derive_evento, calc_costo_con_iva
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/movements", tags=["Movimientos"])
 
@@ -87,9 +91,14 @@ def create_movement(payload: MovementCreate, db: Session = Depends(get_db)):
             },
         ).mappings().one()
         db.commit()
+    except IntegrityError as e:
+        db.rollback()
+        logger.error("IntegrityError en movimiento sku=%s evento=%s: %s", sku, evento, e)
+        raise HTTPException(status_code=400, detail="Movimiento rechazado: datos inconsistentes (proveedor requerido o restricción de integridad)")
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error insertando movimiento: {str(e)}")
+        logger.error("Error inesperado en movimiento sku=%s: %s", sku, e)
+        raise HTTPException(status_code=500, detail="Error interno al registrar el movimiento")
 
     return {"ok": True, "movement": dict(row)}
 
