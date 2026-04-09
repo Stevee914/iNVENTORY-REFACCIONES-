@@ -145,6 +145,8 @@ def update_categoria(categoria_id: int, payload: CategoriaUpdate, db: Session = 
         db.commit()
     except Exception as e:
         db.rollback()
+        if "categoria_name" in str(e):
+            raise HTTPException(status_code=409, detail=f"Ya existe una categoría con ese nombre en el mismo nivel")
         raise HTTPException(status_code=500, detail=str(e))
 
     return {"ok": True, "categoria": dict(row)}

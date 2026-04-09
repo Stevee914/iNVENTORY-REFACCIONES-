@@ -316,13 +316,14 @@ async def import_pos_sync(file: UploadFile = File(...), db: Session = Depends(ge
                 raise ValueError(
                     f"CLAVE muy corta (mín. 5 chars para extraer codigo_cat+sku): '{codigo_pos}'"
                 )
-            costo_pos = parse_float(row.get(_costo_col), 0.0) if _costo_col else 0.0
+            costo_con_iva = parse_float(row.get(_costo_col), 0.0) if _costo_col else 0.0
             rows_parsed.append({
                 "idx": int(idx) + 2,
                 "codigo_pos": codigo_pos,
                 "almactual": parse_float(row.get("ALMACTUAL"), 0.0),
                 "nombre": normalize_text(row.get("DESCRIPCIO")) or codigo_pos,
-                "precio": costo_pos,   # costo_pos_con_iva source
+                "costo_con_iva": costo_con_iva,          # COSTO_CON_ = cost with VAT
+                "costo_sin_iva": round(costo_con_iva / 1.16, 4) if costo_con_iva > 0 else 0.0,
             })
         except Exception as e:
             errors.append({"row": int(idx) + 2, "clave": str(row.get("CLAVE", "")), "error": str(e)})
@@ -411,8 +412,8 @@ async def import_pos_sync(file: UploadFile = File(...), db: Session = Depends(ge
                     existing_no_change += 1
 
                 # Always update cost for existing products (PRECIO1A may change)
-                if r["precio"] > 0:
-                    costo_pos_updates.append({"pid": prod["id"], "costo": r["precio"]})
+                if r["costo_con_iva"] > 0:
+                    costo_pos_updates.append({"pid": prod["id"], "costo": r["costo_con_iva"]})
 
             else:
                 # ── Producto nuevo ──────────────────────────────────
@@ -453,8 +454,8 @@ async def import_pos_sync(file: UploadFile = File(...), db: Session = Depends(ge
                             {
                                 "sku": sku, "name": r["nombre"],
                                 "codigo_pos": codigo_pos, "codigo_cat": codigo_cat,
-                                "price":      r["precio"],
-                                "costo_pos":  r["precio"] if r["precio"] > 0 else None,
+                                "price":      r["costo_sin_iva"] if r["costo_sin_iva"] > 0 else None,
+                                "costo_pos":  r["costo_con_iva"] if r["costo_con_iva"] > 0 else None,
                             },
                         ).mappings().one()
                 except Exception as insert_err:
