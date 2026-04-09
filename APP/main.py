@@ -30,6 +30,7 @@ from APP.routers import (
     facturas,
     faltantes,
     compras,
+    compras_xml,
     pos_sync,
     vehiculos,
     reportes,
@@ -47,6 +48,7 @@ app.include_router(clientes.router)
 app.include_router(facturas.router)
 app.include_router(faltantes.router)
 app.include_router(compras.router)
+app.include_router(compras_xml.router)
 app.include_router(pos_sync.router)
 app.include_router(vehiculos.router)
 app.include_router(reportes.router)
