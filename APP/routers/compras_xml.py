@@ -2,6 +2,8 @@ from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from APP.db import get_db
+from pydantic import BaseModel
+from typing import Optional
 import xml.etree.ElementTree as ET
 
 router = APIRouter(prefix="/compras", tags=["compras-xml"])
@@ -398,4 +400,498 @@ async def upload_xml(
         },
         "estatus_workflow": workflow_status,
         "detalle": line_results,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Pydantic models for review/resolution endpoints
+# ---------------------------------------------------------------------------
+
+class ConfirmarMatchBody(BaseModel):
+    product_id: int
+
+
+class CrearProductoFromXmlBody(BaseModel):
+    sku: str
+    name: str
+    marca: Optional[str] = None
+    categoria_id: Optional[int] = None
+    unit: str = "PZA"
+    min_stock: float = 0
+    price: float = 0
+    precio_publico: Optional[float] = None
+    codigo_cat: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# GET /compras/{compra_id}/revision
+# ---------------------------------------------------------------------------
+
+@router.get("/{compra_id}/revision")
+def get_compra_revision(compra_id: int, db: Session = Depends(get_db)):
+    """Get full review view of an XML purchase with match candidates."""
+
+    compra = db.execute(
+        text("""
+            SELECT c.id, c.proveedor_id, c.folio_factura, c.fecha,
+                   c.subtotal, c.iva, c.total, c.estatus, c.metodo_pago,
+                   c.estatus_recepcion, c.estatus_workflow, c.uuid_fiscal,
+                   c.origen, c.notas,
+                   p.nombre AS proveedor_nombre, p.rfc AS proveedor_rfc
+            FROM compras c
+            LEFT JOIN proveedores p ON p.id = c.proveedor_id
+            WHERE c.id = :id
+        """),
+        {"id": compra_id},
+    ).mappings().first()
+
+    if not compra:
+        raise HTTPException(status_code=404, detail="Compra no encontrada")
+
+    lineas = db.execute(
+        text("""
+            SELECT cd.id, cd.product_id, cd.cantidad, cd.precio_unit,
+                   cd.supplier_sku, cd.descripcion_xml, cd.codigo_proveedor,
+                   cd.clave_prod_serv, cd.descuento, cd.iva,
+                   cd.status_match, cd.matched_by, cd.es_servicio,
+                   pr.sku AS product_sku, pr.name AS product_name
+            FROM compras_detalle cd
+            LEFT JOIN productos pr ON pr.id = cd.product_id
+            WHERE cd.compra_id = :compra_id
+            ORDER BY cd.id
+        """),
+        {"compra_id": compra_id},
+    ).mappings().all()
+
+    lineas_out = []
+    for l in lineas:
+        line_dict = dict(l)
+        line_dict["candidates"] = []
+
+        if l["status_match"] == "SUGGESTED_MATCH" and l["product_id"] is None:
+            code = normalize_code(l["codigo_proveedor"] or "")
+            if code and compra["proveedor_id"]:
+                cands = db.execute(
+                    text("""
+                        SELECT pp.product_id, p.sku, p.name
+                        FROM producto_proveedor pp
+                        JOIN productos p ON p.id = pp.product_id
+                        WHERE pp.proveedor_id = :prov_id
+                          AND UPPER(REPLACE(REPLACE(pp.supplier_sku, '-', ''), ' ', '')) = :code
+                    """),
+                    {"prov_id": compra["proveedor_id"], "code": code},
+                ).mappings().all()
+
+                if not cands:
+                    cands = db.execute(
+                        text("""
+                            SELECT id AS product_id, sku, name
+                            FROM productos
+                            WHERE UPPER(REPLACE(REPLACE(sku, '-', ''), ' ', '')) = :code
+                               OR UPPER(REPLACE(REPLACE(codigo_pos, '-', ''), ' ', '')) LIKE '%' || :code
+                            LIMIT 5
+                        """),
+                        {"code": code},
+                    ).mappings().all()
+
+                line_dict["candidates"] = [dict(c) for c in cands]
+
+        lineas_out.append(line_dict)
+
+    counts = {"MATCHED": 0, "SUGGESTED_MATCH": 0, "UNRESOLVED": 0, "SERVICE": 0}
+    for l in lineas:
+        s = l["status_match"] or "UNRESOLVED"
+        counts[s] = counts.get(s, 0) + 1
+
+    return {
+        "compra": dict(compra),
+        "lineas": lineas_out,
+        "counts": counts,
+        "puede_importar": (counts.get("SUGGESTED_MATCH", 0) + counts.get("UNRESOLVED", 0)) == 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# PATCH /compras/{compra_id}/lineas/{linea_id}/confirmar
+# ---------------------------------------------------------------------------
+
+@router.patch("/{compra_id}/lineas/{linea_id}/confirmar")
+def confirmar_match(
+    compra_id: int,
+    linea_id: int,
+    body: ConfirmarMatchBody,
+    db: Session = Depends(get_db),
+):
+    """Confirm product match for an XML line. Creates producto_proveedor if needed."""
+
+    compra = db.execute(
+        text("SELECT id, proveedor_id, estatus_workflow FROM compras WHERE id = :id"),
+        {"id": compra_id},
+    ).mappings().first()
+
+    if not compra:
+        raise HTTPException(status_code=404, detail="Compra no encontrada")
+    if compra["estatus_workflow"] not in ("REVIEW", "READY"):
+        raise HTTPException(status_code=400, detail="La compra no esta en estado de revision")
+
+    linea = db.execute(
+        text("""
+            SELECT id, status_match, codigo_proveedor, descripcion_xml, precio_unit
+            FROM compras_detalle
+            WHERE id = :lid AND compra_id = :cid
+        """),
+        {"lid": linea_id, "cid": compra_id},
+    ).mappings().first()
+
+    if not linea:
+        raise HTTPException(status_code=404, detail="Linea no encontrada en esta compra")
+    if linea["status_match"] == "MATCHED":
+        raise HTTPException(status_code=400, detail="Esta linea ya esta resuelta")
+    if linea["status_match"] == "SERVICE":
+        raise HTTPException(status_code=400, detail="Las lineas de servicio no requieren match")
+
+    product = db.execute(
+        text("SELECT id, sku, name FROM productos WHERE id = :id"),
+        {"id": body.product_id},
+    ).mappings().first()
+
+    if not product:
+        raise HTTPException(status_code=404, detail=f"Producto no encontrado: id={body.product_id}")
+
+    db.execute(
+        text("""
+            UPDATE compras_detalle
+            SET product_id = :product_id,
+                status_match = 'MATCHED',
+                matched_by = 'MANUAL_LINK'
+            WHERE id = :lid
+        """),
+        {"product_id": body.product_id, "lid": linea_id},
+    )
+
+    if compra["proveedor_id"] and linea["codigo_proveedor"]:
+        existing_pp = db.execute(
+            text("""
+                SELECT id FROM producto_proveedor
+                WHERE product_id = :pid AND proveedor_id = :prov_id
+            """),
+            {"pid": body.product_id, "prov_id": compra["proveedor_id"]},
+        ).scalar()
+
+        if existing_pp:
+            db.execute(
+                text("""
+                    UPDATE producto_proveedor
+                    SET supplier_sku = :sku,
+                        descripcion_proveedor = :desc,
+                        precio_proveedor = :precio
+                    WHERE id = :id
+                """),
+                {
+                    "id": existing_pp,
+                    "sku": linea["codigo_proveedor"],
+                    "desc": linea["descripcion_xml"],
+                    "precio": linea["precio_unit"],
+                },
+            )
+        else:
+            db.execute(
+                text("""
+                    INSERT INTO producto_proveedor
+                        (product_id, proveedor_id, supplier_sku, descripcion_proveedor, precio_proveedor, is_primary, created_at)
+                    VALUES
+                        (:pid, :prov_id, :sku, :desc, :precio, FALSE, NOW())
+                """),
+                {
+                    "pid": body.product_id,
+                    "prov_id": compra["proveedor_id"],
+                    "sku": linea["codigo_proveedor"],
+                    "desc": linea["descripcion_xml"],
+                    "precio": linea["precio_unit"],
+                },
+            )
+
+    pending = db.execute(
+        text("""
+            SELECT COUNT(*) FROM compras_detalle
+            WHERE compra_id = :cid
+              AND status_match IN ('SUGGESTED_MATCH', 'UNRESOLVED')
+        """),
+        {"cid": compra_id},
+    ).scalar()
+
+    new_workflow = "READY" if pending == 0 else "REVIEW"
+    db.execute(
+        text("UPDATE compras SET estatus_workflow = :ws WHERE id = :id"),
+        {"ws": new_workflow, "id": compra_id},
+    )
+
+    db.commit()
+
+    return {
+        "ok": True,
+        "linea_id": linea_id,
+        "product_id": body.product_id,
+        "product_sku": product["sku"],
+        "product_name": product["name"],
+        "status_match": "MATCHED",
+        "matched_by": "MANUAL_LINK",
+        "estatus_workflow": new_workflow,
+        "lineas_pendientes": pending,
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /compras/{compra_id}/lineas/{linea_id}/crear-producto
+# ---------------------------------------------------------------------------
+
+@router.post("/{compra_id}/lineas/{linea_id}/crear-producto")
+def crear_producto_from_xml(
+    compra_id: int,
+    linea_id: int,
+    body: CrearProductoFromXmlBody,
+    db: Session = Depends(get_db),
+):
+    """Create a new product from an unresolved XML line and link it."""
+
+    compra = db.execute(
+        text("SELECT id, proveedor_id, estatus_workflow FROM compras WHERE id = :id"),
+        {"id": compra_id},
+    ).mappings().first()
+
+    if not compra:
+        raise HTTPException(status_code=404, detail="Compra no encontrada")
+    if compra["estatus_workflow"] not in ("REVIEW", "READY"):
+        raise HTTPException(status_code=400, detail="La compra no esta en estado de revision")
+
+    linea = db.execute(
+        text("""
+            SELECT id, status_match, codigo_proveedor, descripcion_xml, precio_unit
+            FROM compras_detalle
+            WHERE id = :lid AND compra_id = :cid
+        """),
+        {"lid": linea_id, "cid": compra_id},
+    ).mappings().first()
+
+    if not linea:
+        raise HTTPException(status_code=404, detail="Linea no encontrada en esta compra")
+    if linea["status_match"] in ("MATCHED", "SERVICE"):
+        raise HTTPException(status_code=400, detail="Esta linea ya esta resuelta")
+
+    sku = body.sku.strip().upper()
+    if not sku:
+        raise HTTPException(status_code=400, detail="SKU es obligatorio")
+
+    sku_exists = db.execute(
+        text("SELECT id FROM productos WHERE UPPER(sku) = :sku"),
+        {"sku": sku},
+    ).scalar()
+    if sku_exists:
+        raise HTTPException(status_code=409, detail=f"SKU ya existe: {sku}. Use confirmar-match en su lugar.")
+
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Nombre es obligatorio")
+
+    unit = body.unit.strip().upper()
+    if unit in ("PIEZA", "PZA"):
+        unit = "PZA"
+    elif unit in ("JUEGO", "JGO"):
+        unit = "JGO"
+
+    codigo_cat = None
+    codigo_pos = None
+    if body.codigo_cat:
+        codigo_cat = body.codigo_cat.strip().replace(" ", "").replace("-", "")
+        try:
+            codigo_cat = str(int(float(codigo_cat))).zfill(4)
+        except Exception:
+            pass
+        if codigo_cat and len(codigo_cat) == 4 and codigo_cat.isdigit():
+            codigo_pos = codigo_cat + sku.replace("-", "").replace(" ", "")
+        else:
+            codigo_cat = None
+
+    try:
+        new_product = db.execute(
+            text("""
+                INSERT INTO productos
+                    (sku, name, marca, categoria_id, unit, min_stock, price, is_active,
+                     codigo_cat, codigo_pos, precio_publico)
+                VALUES
+                    (:sku, :name, :marca, :cat_id, :unit, :min_stock, :price, TRUE,
+                     :codigo_cat, :codigo_pos, :precio_publico)
+                RETURNING id, sku, name
+            """),
+            {
+                "sku": sku,
+                "name": name,
+                "marca": body.marca.strip().upper() if body.marca else None,
+                "cat_id": body.categoria_id,
+                "unit": unit,
+                "min_stock": body.min_stock,
+                "price": body.price,
+                "codigo_cat": codigo_cat,
+                "codigo_pos": codigo_pos,
+                "precio_publico": body.precio_publico,
+            },
+        ).mappings().one()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error creando producto: {str(e)}")
+
+    product_id = new_product["id"]
+
+    db.execute(
+        text("""
+            UPDATE compras_detalle
+            SET product_id = :product_id,
+                status_match = 'MATCHED',
+                matched_by = 'MANUAL_CREATE'
+            WHERE id = :lid
+        """),
+        {"product_id": product_id, "lid": linea_id},
+    )
+
+    if compra["proveedor_id"] and linea["codigo_proveedor"]:
+        db.execute(
+            text("""
+                INSERT INTO producto_proveedor
+                    (product_id, proveedor_id, supplier_sku, descripcion_proveedor, precio_proveedor, is_primary, created_at)
+                VALUES
+                    (:pid, :prov_id, :sku, :desc, :precio, TRUE, NOW())
+            """),
+            {
+                "pid": product_id,
+                "prov_id": compra["proveedor_id"],
+                "sku": linea["codigo_proveedor"],
+                "desc": linea["descripcion_xml"],
+                "precio": linea["precio_unit"],
+            },
+        )
+
+    pending = db.execute(
+        text("""
+            SELECT COUNT(*) FROM compras_detalle
+            WHERE compra_id = :cid
+              AND status_match IN ('SUGGESTED_MATCH', 'UNRESOLVED')
+        """),
+        {"cid": compra_id},
+    ).scalar()
+
+    new_workflow = "READY" if pending == 0 else "REVIEW"
+    db.execute(
+        text("UPDATE compras SET estatus_workflow = :ws WHERE id = :id"),
+        {"ws": new_workflow, "id": compra_id},
+    )
+
+    db.commit()
+
+    return {
+        "ok": True,
+        "linea_id": linea_id,
+        "product_created": {
+            "id": new_product["id"],
+            "sku": new_product["sku"],
+            "name": new_product["name"],
+        },
+        "status_match": "MATCHED",
+        "matched_by": "MANUAL_CREATE",
+        "estatus_workflow": new_workflow,
+        "lineas_pendientes": pending,
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /compras/{compra_id}/importar
+# ---------------------------------------------------------------------------
+
+@router.post("/{compra_id}/importar")
+def importar_compra_xml(compra_id: int, db: Session = Depends(get_db)):
+    """Import resolved XML purchase - generates inventory movements."""
+
+    compra = db.execute(
+        text("SELECT id, proveedor_id, estatus_workflow, uuid_fiscal FROM compras WHERE id = :id"),
+        {"id": compra_id},
+    ).mappings().first()
+
+    if not compra:
+        raise HTTPException(status_code=404, detail="Compra no encontrada")
+    if compra["estatus_workflow"] != "READY":
+        raise HTTPException(
+            status_code=400,
+            detail=f"La compra debe estar en READY para importar (actual: {compra['estatus_workflow']})",
+        )
+
+    lineas = db.execute(
+        text("""
+            SELECT cd.id, cd.product_id, cd.cantidad, cd.precio_unit,
+                   cd.codigo_proveedor, cd.descripcion_xml
+            FROM compras_detalle cd
+            WHERE cd.compra_id = :cid
+              AND cd.status_match = 'MATCHED'
+              AND cd.es_servicio = FALSE
+        """),
+        {"cid": compra_id},
+    ).mappings().all()
+
+    if not lineas:
+        raise HTTPException(status_code=400, detail="No hay lineas resueltas para importar")
+
+    reference = f"COMPRA_XML_{compra['uuid_fiscal'] or compra_id}"
+    movements_created = 0
+
+    for l in lineas:
+        if not l["product_id"]:
+            continue
+
+        db.execute(
+            text("""
+                INSERT INTO movimientos_inventario
+                    (product_id, libro, movement_type, quantity, reference, notes, movement_date, created_at)
+                VALUES
+                    (:product_id, 'FISICO', 'IN', :quantity, :reference, :notes, NOW(), NOW())
+            """),
+            {
+                "product_id": l["product_id"],
+                "quantity": abs(float(l["cantidad"])),
+                "reference": reference,
+                "notes": f"XML import: {l['codigo_proveedor']} - {l['descripcion_xml'] or ''}",
+            },
+        )
+        movements_created += 1
+
+        if compra["proveedor_id"] and l["precio_unit"]:
+            db.execute(
+                text("""
+                    UPDATE producto_proveedor
+                    SET precio_proveedor = :precio
+                    WHERE product_id = :pid AND proveedor_id = :prov_id
+                """),
+                {
+                    "precio": l["precio_unit"],
+                    "pid": l["product_id"],
+                    "prov_id": compra["proveedor_id"],
+                },
+            )
+
+    db.execute(
+        text("""
+            UPDATE compras
+            SET estatus_workflow = 'IMPORTED',
+                estatus_recepcion = 'RECIBIDA'
+            WHERE id = :id
+        """),
+        {"id": compra_id},
+    )
+
+    db.commit()
+
+    return {
+        "ok": True,
+        "compra_id": compra_id,
+        "movements_created": movements_created,
+        "reference": reference,
+        "estatus_workflow": "IMPORTED",
+        "estatus_recepcion": "RECIBIDA",
     }
