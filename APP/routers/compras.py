@@ -26,10 +26,18 @@ METODOS_PAGO = (
 # ── Schemas ──────────────────────────────────────────────────────────────────
 
 class DetalleItem(BaseModel):
-    product_id:   int
-    cantidad:     float
-    precio_unit:  Optional[float] = None
-    supplier_sku: Optional[str]   = None
+    product_id:       int | None      = None   # None for unresolved XML lines
+    cantidad:         float
+    precio_unit:      Optional[float] = None
+    supplier_sku:     Optional[str]   = None
+    descripcion_xml:  Optional[str]   = None
+    codigo_proveedor: Optional[str]   = None
+    clave_prod_serv:  Optional[str]   = None
+    descuento:        float           = 0
+    iva:              float           = 0
+    status_match:     Optional[str]   = None
+    matched_by:       Optional[str]   = None
+    es_servicio:      bool            = False
 
 
 def _validate_fecha(v: date) -> date:
@@ -407,9 +415,17 @@ def get_compra_detalle(compra_id: int, db: Session = Depends(get_db)):
             cd.cantidad,
             cd.precio_unit,
             cd.supplier_sku,
+            cd.descripcion_xml,
+            cd.codigo_proveedor,
+            cd.clave_prod_serv,
+            cd.descuento,
+            cd.iva,
+            cd.status_match,
+            cd.matched_by,
+            cd.es_servicio,
             cd.created_at
         FROM compras_detalle cd
-        JOIN productos p ON p.id = cd.product_id
+        LEFT JOIN productos p ON p.id = cd.product_id
         WHERE cd.compra_id = :cid
         ORDER BY cd.id
     """), {"cid": compra_id}).mappings().all()
@@ -518,8 +534,9 @@ def create_compra(payload: CompraCreate, db: Session = Depends(get_db)):
     for item in payload.detalle:
         if item.cantidad <= 0:
             raise HTTPException(status_code=400, detail=f"cantidad debe ser > 0 (product_id={item.product_id})")
-        if not db.execute(text("SELECT 1 FROM productos WHERE id = :id"), {"id": item.product_id}).scalar():
-            raise HTTPException(status_code=404, detail=f"Producto no encontrado: {item.product_id}")
+        if item.product_id is not None:
+            if not db.execute(text("SELECT 1 FROM productos WHERE id = :id"), {"id": item.product_id}).scalar():
+                raise HTTPException(status_code=404, detail=f"Producto no encontrado: {item.product_id}")
 
     try:
         new_id = db.execute(text("""
@@ -555,17 +572,31 @@ def create_compra(payload: CompraCreate, db: Session = Depends(get_db)):
 
         for item in payload.detalle:
             db.execute(text("""
-                INSERT INTO compras_detalle (compra_id, product_id, cantidad, precio_unit, supplier_sku)
-                VALUES (:cid, :pid, :qty, :precio, :sku)
+                INSERT INTO compras_detalle
+                    (compra_id, product_id, cantidad, precio_unit, supplier_sku,
+                     descripcion_xml, codigo_proveedor, clave_prod_serv,
+                     descuento, iva, status_match, matched_by, es_servicio)
+                VALUES
+                    (:cid, :pid, :qty, :precio, :sku,
+                     :descripcion_xml, :codigo_proveedor, :clave_prod_serv,
+                     :descuento, :iva, :status_match, :matched_by, :es_servicio)
             """), {
-                "cid":    new_id,
-                "pid":    item.product_id,
-                "qty":    item.cantidad,
-                "precio": item.precio_unit,
-                "sku":    item.supplier_sku,
+                "cid":             new_id,
+                "pid":             item.product_id,
+                "qty":             item.cantidad,
+                "precio":          item.precio_unit,
+                "sku":             item.supplier_sku,
+                "descripcion_xml": item.descripcion_xml,
+                "codigo_proveedor": item.codigo_proveedor,
+                "clave_prod_serv": item.clave_prod_serv,
+                "descuento":       item.descuento,
+                "iva":             item.iva,
+                "status_match":    item.status_match,
+                "matched_by":      item.matched_by,
+                "es_servicio":     item.es_servicio,
             })
             # precio_unit in compras_detalle is sin IVA — use directly as costo_real
-            if item.precio_unit and item.precio_unit > 0:
+            if item.product_id is not None and item.precio_unit and item.precio_unit > 0:
                 db.execute(text("""
                     UPDATE productos SET
                         costo_real_sin_iva    = :costo,
@@ -761,8 +792,15 @@ def update_compra(compra_id: int, payload: CompraUpdate, db: Session = Depends(g
 
 @router.delete("/{compra_id}")
 def delete_compra(compra_id: int, db: Session = Depends(get_db)):
-    if not db.execute(text("SELECT 1 FROM compras WHERE id = :id"), {"id": compra_id}).scalar():
+    row = db.execute(
+        text("SELECT estatus_workflow FROM compras WHERE id = :id"),
+        {"id": compra_id},
+    ).mappings().first()
+    if not row:
         raise HTTPException(status_code=404, detail="Compra no encontrada")
+    if row["estatus_workflow"] == "IMPORTED":
+        raise HTTPException(status_code=400, detail="No se puede eliminar una compra ya importada")
+    db.execute(text("DELETE FROM compras_detalle WHERE compra_id = :id"), {"id": compra_id})
     db.execute(text("DELETE FROM compras WHERE id = :id"), {"id": compra_id})
     db.commit()
     return {"ok": True}
