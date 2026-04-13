@@ -1,0 +1,13 @@
+export { productService } from './products';
+export { stockService } from './stock';
+export { movementService } from './movements';
+export { forecastService } from './forecast';
+export { proveedorService } from './proveedores';
+export { categoriaService } from './categorias';
+export { dashboardService } from './dashboard';
+export { productoProveedorService } from './productoProveedor';
+export { clienteService } from './clienteService';
+export { facturaService } from './facturaService';
+export { comprasService } from './comprasService';
+export { reportesService } from './reportesService';
+export type { InventarioItem, InventarioKpis, ForecastItemReal, ForecastKpis } from './reportesService';
