@@ -195,6 +195,61 @@ def match_line(db: Session, proveedor_id: int, no_identificacion: str) -> dict:
     return {"status_match": "UNRESOLVED", "matched_by": None, "product_id": None, "candidates": []}
 
 
+def recalculate_compra_totals(db: Session, compra_id: int):
+    """Recalculate compra subtotal/iva/total based on non-excluded, non-service lines and financial discount."""
+
+    lineas = db.execute(
+        text("""
+            SELECT precio_unit, cantidad, iva, descuento
+            FROM compras_detalle
+            WHERE compra_id = :cid
+              AND status_match != 'EXCLUDED'
+              AND es_servicio = FALSE
+        """),
+        {"cid": compra_id},
+    ).mappings().all()
+
+    servicios = db.execute(
+        text("""
+            SELECT precio_unit, cantidad, iva
+            FROM compras_detalle
+            WHERE compra_id = :cid
+              AND status_match != 'EXCLUDED'
+              AND es_servicio = TRUE
+        """),
+        {"cid": compra_id},
+    ).mappings().all()
+
+    subtotal_productos = sum(float(l["precio_unit"] or 0) * float(l["cantidad"] or 0) for l in lineas)
+    iva_productos = sum(float(l["iva"] or 0) for l in lineas)
+
+    subtotal_servicios = sum(float(s["precio_unit"] or 0) * float(s["cantidad"] or 0) for s in servicios)
+    iva_servicios = sum(float(s["iva"] or 0) for s in servicios)
+
+    subtotal_before_discount = subtotal_productos + subtotal_servicios
+    iva_before_discount = iva_productos + iva_servicios
+
+    compra = db.execute(
+        text("SELECT descuento_financiero FROM compras WHERE id = :id"),
+        {"id": compra_id},
+    ).mappings().first()
+
+    descuento_pct = float(compra["descuento_financiero"] or 0) / 100.0
+
+    subtotal_final = round(subtotal_before_discount * (1 - descuento_pct), 2)
+    iva_final = round(iva_before_discount * (1 - descuento_pct), 2)
+    total_final = round(subtotal_final + iva_final, 2)
+
+    db.execute(
+        text("""
+            UPDATE compras
+            SET subtotal = :subtotal, iva = :iva, total = :total
+            WHERE id = :id
+        """),
+        {"subtotal": subtotal_final, "iva": iva_final, "total": total_final, "id": compra_id},
+    )
+
+
 @router.post("/upload-xml")
 async def upload_xml(
     file: UploadFile = File(...),
@@ -258,18 +313,19 @@ async def upload_xml(
                     (proveedor_id, folio_factura, fecha, subtotal, iva, total,
                      estatus, metodo_pago, notas, origen,
                      estatus_recepcion, estatus_workflow, uuid_fiscal,
+                     subtotal_original, iva_original, total_original,
                      created_at, updated_at)
                 VALUES
-                    (:proveedor_id, :folio_factura, :fecha, :subtotal, :iva, :total,
+                    (:proveedor_id, :folio_factura, CURRENT_DATE, :subtotal, :iva, :total,
                      :estatus, :metodo_pago, :notas, 'XML',
                      'PENDIENTE', 'REVIEW', :uuid_fiscal,
+                     :subtotal_original, :iva_original, :total_original,
                      NOW(), NOW())
                 RETURNING id
             """),
             {
                 "proveedor_id": proveedor_id,
                 "folio_factura": folio_factura,
-                "fecha": parsed["fecha"][:10] if parsed["fecha"] else None,
                 "subtotal": parsed["subtotal"] - parsed["descuento_total"],
                 "iva": parsed["iva_total"],
                 "total": parsed["total"],
@@ -277,6 +333,9 @@ async def upload_xml(
                 "metodo_pago": metodo_pago_xml,
                 "notas": f"Importado desde XML. Emisor: {parsed.get('emisor_nombre', '')}",
                 "uuid_fiscal": uuid,
+                "subtotal_original": parsed["subtotal"] - parsed["descuento_total"],
+                "iva_original": parsed["iva_total"],
+                "total_original": parsed["total"],
             },
         ).scalar()
     except Exception as e:
@@ -437,6 +496,7 @@ def get_compra_revision(compra_id: int, db: Session = Depends(get_db)):
                    c.subtotal, c.iva, c.total, c.estatus, c.metodo_pago,
                    c.estatus_recepcion, c.estatus_workflow, c.uuid_fiscal,
                    c.origen, c.notas,
+                   c.descuento_financiero, c.subtotal_original, c.iva_original, c.total_original,
                    p.nombre AS proveedor_nombre, p.rfc AS proveedor_rfc
             FROM compras c
             LEFT JOIN proveedores p ON p.id = c.proveedor_id
@@ -730,7 +790,7 @@ def crear_producto_from_xml(
                 "cat_id": body.categoria_id,
                 "unit": unit,
                 "min_stock": body.min_stock,
-                "price": body.price,
+                "price": body.price if body.price else (float(linea["precio_unit"]) if linea["precio_unit"] else 0),
                 "codigo_cat": codigo_cat,
                 "codigo_pos": codigo_pos,
                 "precio_publico": body.precio_publico,
@@ -811,7 +871,7 @@ def importar_compra_xml(compra_id: int, db: Session = Depends(get_db)):
     """Import resolved XML purchase - generates inventory movements."""
 
     compra = db.execute(
-        text("SELECT id, proveedor_id, estatus_workflow, uuid_fiscal FROM compras WHERE id = :id"),
+        text("SELECT id, proveedor_id, estatus_workflow, uuid_fiscal, descuento_financiero FROM compras WHERE id = :id"),
         {"id": compra_id},
     ).mappings().first()
 
@@ -830,6 +890,7 @@ def importar_compra_xml(compra_id: int, db: Session = Depends(get_db)):
             FROM compras_detalle cd
             WHERE cd.compra_id = :cid
               AND cd.status_match = 'MATCHED'
+              AND cd.status_match != 'EXCLUDED'
               AND cd.es_servicio = FALSE
         """),
         {"cid": compra_id},
@@ -840,6 +901,8 @@ def importar_compra_xml(compra_id: int, db: Session = Depends(get_db)):
 
     reference = f"COMPRA_XML_{compra['uuid_fiscal'] or compra_id}"
     movements_created = 0
+
+    descuento_pct = float(compra["descuento_financiero"] or 0) / 100.0
 
     for l in lineas:
         if not l["product_id"]:
@@ -862,6 +925,7 @@ def importar_compra_xml(compra_id: int, db: Session = Depends(get_db)):
         movements_created += 1
 
         if compra["proveedor_id"] and l["precio_unit"]:
+            precio_real = float(l["precio_unit"]) * (1 - descuento_pct)
             db.execute(
                 text("""
                     UPDATE producto_proveedor
@@ -869,10 +933,14 @@ def importar_compra_xml(compra_id: int, db: Session = Depends(get_db)):
                     WHERE product_id = :pid AND proveedor_id = :prov_id
                 """),
                 {
-                    "precio": l["precio_unit"],
+                    "precio": precio_real,
                     "pid": l["product_id"],
                     "prov_id": compra["proveedor_id"],
                 },
+            )
+            db.execute(
+                text("UPDATE productos SET price = :precio WHERE id = :product_id"),
+                {"precio": precio_real, "product_id": l["product_id"]},
             )
 
     db.execute(
@@ -894,4 +962,147 @@ def importar_compra_xml(compra_id: int, db: Session = Depends(get_db)):
         "reference": reference,
         "estatus_workflow": "IMPORTED",
         "estatus_recepcion": "RECIBIDA",
+    }
+
+
+@router.patch("/{compra_id}/lineas/{linea_id}/excluir")
+def excluir_linea(compra_id: int, linea_id: int, db: Session = Depends(get_db)):
+    row = db.execute(
+        text("SELECT status_match, matched_by FROM compras_detalle WHERE id = :id AND compra_id = :cid"),
+        {"id": linea_id, "cid": compra_id},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Linea no encontrada")
+    if row["status_match"] == "EXCLUDED":
+        raise HTTPException(status_code=400, detail="Linea ya excluida")
+
+    # Store previous status in matched_by so we can restore it later
+    prev_status = row["status_match"]
+    db.execute(
+        text("""
+            UPDATE compras_detalle
+            SET status_match = 'EXCLUDED', matched_by = :prev
+            WHERE id = :id
+        """),
+        {"prev": f"PREV:{prev_status}", "id": linea_id},
+    )
+
+    # Recalculate workflow: only SUGGESTED_MATCH and UNRESOLVED block READY
+    pending = db.execute(
+        text("""
+            SELECT COUNT(*) FROM compras_detalle
+            WHERE compra_id = :cid
+              AND status_match IN ('SUGGESTED_MATCH', 'UNRESOLVED')
+        """),
+        {"cid": compra_id},
+    ).scalar()
+    new_workflow = "READY" if pending == 0 else "REVIEW"
+    db.execute(
+        text("UPDATE compras SET estatus_workflow = :wf WHERE id = :cid"),
+        {"wf": new_workflow, "cid": compra_id},
+    )
+
+    recalculate_compra_totals(db, compra_id)
+
+    db.commit()
+    return {"ok": True, "linea_id": linea_id, "status_match": "EXCLUDED", "estatus_workflow": new_workflow}
+
+
+@router.patch("/{compra_id}/lineas/{linea_id}/incluir")
+def incluir_linea(compra_id: int, linea_id: int, db: Session = Depends(get_db)):
+    row = db.execute(
+        text("SELECT status_match, matched_by FROM compras_detalle WHERE id = :id AND compra_id = :cid"),
+        {"id": linea_id, "cid": compra_id},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Linea no encontrada")
+    if row["status_match"] != "EXCLUDED":
+        raise HTTPException(status_code=400, detail="Linea no está excluida")
+
+    # Restore previous status (stored as "PREV:STATUS" in matched_by)
+    matched_by_val = row["matched_by"] or ""
+    if matched_by_val.startswith("PREV:"):
+        restored_status = matched_by_val[5:]
+    else:
+        restored_status = "UNRESOLVED"
+
+    db.execute(
+        text("""
+            UPDATE compras_detalle
+            SET status_match = :st, matched_by = NULL
+            WHERE id = :id
+        """),
+        {"st": restored_status, "id": linea_id},
+    )
+
+    # Recalculate workflow
+    pending = db.execute(
+        text("""
+            SELECT COUNT(*) FROM compras_detalle
+            WHERE compra_id = :cid
+              AND status_match IN ('SUGGESTED_MATCH', 'UNRESOLVED')
+        """),
+        {"cid": compra_id},
+    ).scalar()
+    new_workflow = "READY" if pending == 0 else "REVIEW"
+    db.execute(
+        text("UPDATE compras SET estatus_workflow = :wf WHERE id = :cid"),
+        {"wf": new_workflow, "cid": compra_id},
+    )
+
+    recalculate_compra_totals(db, compra_id)
+
+    db.commit()
+    return {"ok": True, "linea_id": linea_id, "status_match": restored_status, "estatus_workflow": new_workflow}
+
+
+class DescuentoFinancieroBody(BaseModel):
+    porcentaje: float
+
+
+@router.patch("/{compra_id}/descuento-financiero")
+def set_descuento_financiero(compra_id: int, body: DescuentoFinancieroBody, db: Session = Depends(get_db)):
+    compra = db.execute(
+        text("SELECT id, estatus_workflow FROM compras WHERE id = :id"),
+        {"id": compra_id},
+    ).mappings().first()
+    if not compra:
+        raise HTTPException(status_code=404, detail="Compra no encontrada")
+    if compra["estatus_workflow"] not in ("REVIEW", "READY", None):
+        raise HTTPException(status_code=400, detail="La compra ya fue importada")
+    if body.porcentaje < 0 or body.porcentaje > 100:
+        raise HTTPException(status_code=400, detail="Porcentaje debe ser entre 0 y 100")
+
+    db.execute(
+        text("UPDATE compras SET descuento_financiero = :pct WHERE id = :id"),
+        {"pct": body.porcentaje, "id": compra_id},
+    )
+
+    recalculate_compra_totals(db, compra_id)
+
+    updated = db.execute(
+        text("""
+            SELECT subtotal, iva, total,
+                   subtotal_original, iva_original, total_original,
+                   descuento_financiero
+            FROM compras WHERE id = :id
+        """),
+        {"id": compra_id},
+    ).mappings().first()
+
+    db.commit()
+
+    return {
+        "ok": True,
+        "descuento_financiero": float(updated["descuento_financiero"]),
+        "original": {
+            "subtotal": float(updated["subtotal_original"] or 0),
+            "iva": float(updated["iva_original"] or 0),
+            "total": float(updated["total_original"] or 0),
+        },
+        "actual": {
+            "subtotal": float(updated["subtotal"]),
+            "iva": float(updated["iva"]),
+            "total": float(updated["total"]),
+        },
     }
