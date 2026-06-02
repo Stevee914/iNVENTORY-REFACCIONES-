@@ -1,0 +1,30 @@
+{
+  "business_name": "Refacciones y Llantas Jaime",
+  "business_short_name": "RLJ",
+  "currency": "MXN",
+  "timezone": "America/Mexico_City",
+  "modules": {
+    "pos_sync": true,
+    "physical_count": true,
+    "barcode_labels": true,
+    "faltantes": true,
+    "vehicle_compatibility": true,
+    "heavy_duty_engines": true,
+    "forecast": true,
+    "compras_xml": true,
+    "pagos_proveedor": true
+  },
+  "inventory": {
+    "books": ["FISICO", "FISCAL_POS"],
+    "default_book": "FISICO",
+    "allow_negative_fiscal": true
+  },
+  "barcodes": {
+    "default_format": "CODE128",
+    "default_value_field": "sku"
+  },
+  "branding": {
+    "primary_color": "#E1261C",
+    "secondary_color": "#111111"
+  }
+}

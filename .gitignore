@@ -29,3 +29,6 @@ test.py
 
 # One-off data enrichment scripts (not production code)
 APP/scripts/
+
+# Generated output
+exports/
