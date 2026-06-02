@@ -99,17 +99,6 @@ Ejecución local
 uvicorn APP.main:app --reload
 Archivos excluidos del repositorio
 
-Por seguridad y orden, este repositorio no incluye:
-
-.env
-
-.venv/
-
-__pycache__/
-
-.history/
-
-archivos temporales de pruebas
 
 Roadmap
 
