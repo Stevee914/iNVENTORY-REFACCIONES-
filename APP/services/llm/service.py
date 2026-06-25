@@ -31,6 +31,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PROVIDER = "claude"
 
+# Tope duro de caracteres que el resultado de una tool puede devolver al LLM.
+# Evita inyectar payloads enormes al contexto (control de tokens/costo).
+MAX_TOOL_RESULT_CHARS = 8000
+
 # Logger de métricas dedicado: emite una línea estructurada por request de chat.
 # Self-contained para que sea visible aunque el backend no configure logging.
 metrics_logger = logging.getLogger("llm.metrics")
@@ -60,6 +64,29 @@ def _summarize_action(tool: str, args: dict) -> str:
     """Resumen legible de una acción mutante propuesta, para confirmación."""
     detalle = ", ".join(f"{k}={v}" for k, v in args.items()) if args else "(sin argumentos)"
     return f"{tool}: {detalle}"
+
+
+def _cap_tool_result(tool_name: str, result: str) -> str:
+    """Registra la longitud del resultado de una tool y lo trunca si excede el
+    tope, devolviendo un mensaje controlado en vez de inyectar un payload enorme."""
+    n = len(result)
+    metrics_logger.info(json.dumps({
+        "event": "tool_result",
+        "tool": tool_name,
+        "chars": n,
+        "truncated": n > MAX_TOOL_RESULT_CHARS,
+    }, ensure_ascii=False))
+    if n <= MAX_TOOL_RESULT_CHARS:
+        return result
+    msg = (f"Resultado demasiado largo ({n} chars), truncado. "
+           f"Pide un filtro o límite más específico.")
+    # Reserva espacio para el envoltorio JSON y garantiza tope final estricto.
+    header = json.dumps({"status": "truncated", "message": msg, "data_preview": ""},
+                        ensure_ascii=False)
+    budget = max(0, MAX_TOOL_RESULT_CHARS - len(header))
+    out = json.dumps({"status": "truncated", "message": msg,
+                      "data_preview": result[:budget]}, ensure_ascii=False)
+    return out[:MAX_TOOL_RESULT_CHARS]
 
 
 @dataclass
@@ -175,7 +202,7 @@ def generate_chat_response(
                         }, ensure_ascii=False),
                     })
                     continue
-                result = tool_runner(tc.name, tc.input)
+                result = _cap_tool_result(tc.name, tool_runner(tc.name, tc.input))
                 tool_calls_log.append({"tool": tc.name, "input": tc.input})
                 history.append({
                     "role": "tool",

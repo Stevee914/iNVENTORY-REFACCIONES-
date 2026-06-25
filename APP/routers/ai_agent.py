@@ -25,6 +25,18 @@ from APP.services.llm import generate_chat_response, LLMProviderError
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/ai", tags=["AI Agent"])
 
+# ── Control de consumo de tokens ────────────────────────────────────────────────
+MAX_HISTORY_MESSAGES = 10   # solo se envían al LLM los últimos N mensajes del chat
+
+
+def _clamp_limit(value, default: int, maximum: int) -> int:
+    """Normaliza el 'limit' que pide el modelo: entero, mínimo 1, tope duro `maximum`."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        n = default
+    return max(1, min(n, maximum))
+
 # ── Tool definitions ───────────────────────────────────────────────────────────
 TOOLS = [
     {
@@ -38,7 +50,7 @@ TOOLS = [
                 "categoria":  {"type": "string",  "description": "Filtrar por nombre de categoría"},
                 "sin_precio": {"type": "boolean", "description": "Solo productos sin precio público"},
                 "sin_cat":    {"type": "boolean", "description": "Solo productos sin categoría"},
-                "limit":      {"type": "integer", "description": "Máximo de resultados (default 20)"},
+                "limit":      {"type": "integer", "description": "Máximo de resultados (default 20, tope 30)"},
             },
         },
     },
@@ -50,7 +62,7 @@ TOOLS = [
             "properties": {
                 "dias":      {"type": "integer", "description": "Días sin movimiento (ej. 180)"},
                 "categoria": {"type": "string",  "description": "Filtrar por categoría (opcional)"},
-                "limit":     {"type": "integer", "description": "Máximo de resultados (default 30)"},
+                "limit":     {"type": "integer", "description": "Máximo de resultados (default 20, tope 50)"},
             },
             "required": ["dias"],
         },
@@ -117,7 +129,7 @@ def _buscar_productos(inp: dict, db: Session) -> str:
         wheres.append("(p.precio_publico IS NULL OR p.precio_publico = 0)")
     if inp.get("sin_cat"):
         wheres.append("p.categoria_id IS NULL")
-    limit = min(inp.get("limit", 20), 50)
+    limit = _clamp_limit(inp.get("limit"), default=20, maximum=30)
     rows = db.execute(text(f"""
         SELECT p.sku, p.name, p.marca, p.precio_publico,
                COALESCE(c.name,'Sin categoría') AS categoria,
@@ -134,7 +146,7 @@ def _buscar_productos(inp: dict, db: Session) -> str:
 
 def _productos_sin_movimiento(inp: dict, db: Session) -> str:
     dias  = inp.get("dias", 180)
-    limit = min(inp.get("limit", 30), 100)
+    limit = _clamp_limit(inp.get("limit"), default=20, maximum=50)
     cat_filter = ""
     params: dict = {"dias": dias, "lim": limit}
     if inp.get("categoria"):
@@ -272,6 +284,12 @@ class ChatResponse(BaseModel):
 @router.post("/chat")
 def chat(payload: ChatRequest, db: Session = Depends(get_db)):
     messages = [{"role": m.role, "content": m.content} for m in payload.messages]
+
+    # Control de tokens: enviar al LLM solo los últimos N mensajes del chat,
+    # asegurando que el historial arranque en un mensaje 'user'.
+    messages = messages[-MAX_HISTORY_MESSAGES:]
+    while messages and messages[0]["role"] != "user":
+        messages.pop(0)
 
     try:
         result = generate_chat_response(
