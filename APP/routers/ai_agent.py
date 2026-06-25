@@ -256,6 +256,7 @@ class ChatResponse(BaseModel):
     reply:        str
     tool_calls:   list[dict] = []
     pending_action: Optional[dict] = None  # acción pendiente de confirmación
+    meta:         Optional[dict] = None     # metadatos seguros (provider/model/latencia); sin keys ni prompts
 
 
 # ── Chat endpoint ──────────────────────────────────────────────────────────────
@@ -270,7 +271,7 @@ def chat(payload: ChatRequest, db: Session = Depends(get_db)):
             tools=TOOLS,
             tool_runner=lambda name, inp: run_tool(name, inp, db),
             max_iters=5,
-            pending_tools=("actualizar_producto",),
+            mutating_tools=("actualizar_producto",),
             api_key_override=payload.api_key,
         )
     except LLMProviderError as e:
@@ -284,6 +285,12 @@ def chat(payload: ChatRequest, db: Session = Depends(get_db)):
         reply=result.reply,
         tool_calls=result.tool_calls,
         pending_action=result.pending_action,
+        meta={
+            "provider": result.provider,
+            "model": result.model,
+            "latency_ms": result.latency_ms,
+            "tool_call_count": result.tool_call_count,
+        },
     )
 
 
