@@ -366,6 +366,18 @@ class ChatResponse(BaseModel):
     meta:         Optional[dict] = None     # metadatos seguros (provider/model/latencia); sin keys ni prompts
 
 
+# Campos que el flujo de confirmación permite actualizar (lista blanca dura).
+SAFE_UPDATE_FIELDS = ("nombre", "marca", "categoria_id", "precio_publico", "is_active")
+
+
+class PendingActionModel(BaseModel):
+    tool:  str
+    input: dict
+
+class ConfirmActionRequest(BaseModel):
+    action: PendingActionModel
+
+
 # ── Chat endpoint ──────────────────────────────────────────────────────────────
 @router.post("/chat")
 def chat(payload: ChatRequest, db: Session = Depends(get_db)):
@@ -405,6 +417,61 @@ def chat(payload: ChatRequest, db: Session = Depends(get_db)):
             "tool_call_count": result.tool_call_count,
         },
     )
+
+
+# ── Confirmación dura de acción mutante (sin LLM) ─────────────────────────────
+@router.post("/confirm-action")
+def confirm_action(payload: ConfirmActionRequest, db: Session = Depends(get_db)):
+    """Ejecuta una acción pendiente PREVIA confirmación explícita del usuario.
+
+    Es la ÚNICA vía por la que se ejecuta una tool mutante. No usa el LLM, no
+    acepta tools arbitrarias y solo aplica campos de una lista blanca dura.
+    """
+    action = payload.action
+    if action.tool != "actualizar_producto":
+        return {"ok": False, "error": f"Acción no permitida: {action.tool}"}
+
+    raw = action.input or {}
+    sku = raw.get("sku")
+    sku = sku.strip() if isinstance(sku, str) else sku
+    if not sku:
+        return {"ok": False, "error": "Falta el SKU del producto."}
+    existe = db.execute(text("SELECT 1 FROM productos WHERE sku = :s"), {"s": sku}).scalar()
+    if not existe:
+        return {"ok": False, "error": f"Producto no encontrado: {sku}"}
+
+    # Solo campos de la lista blanca, no vacíos, con coerción de tipo defensiva.
+    safe: dict = {"sku": sku}
+    for k in SAFE_UPDATE_FIELDS:
+        if k not in raw or raw[k] in (None, ""):
+            continue
+        v = raw[k]
+        if k == "precio_publico":
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                continue
+        elif k == "categoria_id":
+            try:
+                v = int(v)
+            except (TypeError, ValueError):
+                continue
+        elif k == "is_active":
+            v = v if isinstance(v, bool) else str(v).strip().lower() in ("true", "1", "si", "sí")
+        safe[k] = v
+
+    if len(safe) == 1:  # solo 'sku' → nada que actualizar
+        return {"ok": False, "error": "No hay campos válidos para actualizar."}
+
+    resultado = json.loads(_actualizar_producto(safe, db))
+    if not resultado.get("ok"):
+        return {"ok": False, "error": resultado.get("error", "No se pudo actualizar."), "sku": sku}
+    return {
+        "ok": True,
+        "sku": sku,
+        "campos_actualizados": [k for k in safe if k != "sku"],
+        "valores": {k: v for k, v in safe.items() if k != "sku"},
+    }
 
 
 # ── Pendientes endpoint (para la pestaña de tareas) ───────────────────────────
