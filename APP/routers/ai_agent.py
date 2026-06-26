@@ -13,6 +13,7 @@ Tools disponibles:
 
 import json
 import logging
+import unicodedata
 from typing import Optional
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
@@ -37,17 +38,39 @@ def _clamp_limit(value, default: int, maximum: int) -> int:
         n = default
     return max(1, min(n, maximum))
 
+
+# Palabras de intención/relleno que se ignoran al tokenizar una búsqueda,
+# para que "stock del filtro g-33" busque por "filtro" + "g-33".
+_SEARCH_STOPWORDS = {
+    "stock", "stok", "stocks", "existencia", "existencias", "inventario",
+    "el", "la", "los", "las", "un", "una", "de", "del", "para", "con",
+    "dame", "busca", "buscar", "muestra", "muestrame", "ver", "hay", "precio",
+    "cuanto", "cuantos", "tengo", "tienes", "necesito", "quiero",
+}
+
+
+def _strip_accents(s: str) -> str:
+    """Quita acentos/diacríticos (NFKD)."""
+    return "".join(ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch))
+
+
+def _normalize_code(s: str) -> str:
+    """Normaliza un código/término para comparación: sin acentos, mayúsculas,
+    sin guiones ni espacios. Ej: 'G-33', 'g 33', 'g33' -> 'G33'."""
+    return _strip_accents(s).upper().replace("-", "").replace(" ", "")
+
 # ── Tool definitions ───────────────────────────────────────────────────────────
 TOOLS = [
     {
         "name": "buscar_productos",
-        "description": "Busca productos en el catálogo por texto libre, marca o categoría.",
+        "description": "Busca productos por nombre, SKU, código POS, marca o categoría. Tolera guiones y espacios (G-33, G 33 y g33 coinciden). Devuelve sku, nombre, marca, código POS, precio_publico, categoría y stock (físico y POS). Úsala también para preguntas de stock/existencia de un producto.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "q":          {"type": "string",  "description": "Texto de búsqueda (nombre, SKU)"},
+                "q":          {"type": "string",  "description": "Término del producto (nombre, SKU o código). Pasa SOLO el producto, sin palabras como 'stock', 'existencia' o 'precio'."},
                 "marca":      {"type": "string",  "description": "Filtrar por marca"},
                 "categoria":  {"type": "string",  "description": "Filtrar por nombre de categoría"},
+                "precio":     {"type": "number",  "description": "Precio público EXACTO (igualdad, no rangos). Ej: 10 para productos que cuestan exactamente $10. No soporta rangos ni 'menor/mayor que'."},
                 "sin_precio": {"type": "boolean", "description": "Solo productos sin precio público"},
                 "sin_cat":    {"type": "boolean", "description": "Solo productos sin categoría"},
                 "limit":      {"type": "integer", "description": "Máximo de resultados (default 20, tope 30)"},
@@ -116,30 +139,76 @@ def run_tool(name: str, inputs: dict, db: Session) -> str:
 
 def _buscar_productos(inp: dict, db: Session) -> str:
     wheres, params = ["p.is_active = true", "p.catalog_visible = true"], {}
-    if inp.get("q"):
-        wheres.append("(p.sku ILIKE :q OR p.name ILIKE :q)")
-        params["q"] = f"%{inp['q']}%"
+
+    order_by = "p.name"
+    raw_q = str(inp.get("q") or "").strip()
+    if raw_q:
+        # Tokeniza ignorando palabras de intención (stock, del, ...). Cada token
+        # se compara (substring, case-insensitive) contra sku/name/codigo_pos/
+        # marca/categoría, y de forma NORMALIZADA (sin acentos/guiones/espacios)
+        # contra sku y codigo_pos. AND entre tokens (>=2 chars).
+        # Además, la query completa colapsada a código (G 33 -> G33) se compara
+        # contra sku/codigo_pos, para que "G 33" encuentre el SKU "G33".
+        filtered = [t for t in _strip_accents(raw_q).split() if t.lower() not in _SEARCH_STOPWORDS]
+        if not filtered:
+            filtered = [_strip_accents(raw_q)]
+        and_tokens = [t for t in filtered if len(t) >= 2] or filtered
+        qn_full = _normalize_code("".join(filtered))
+
+        token_clauses = []
+        for i, tok in enumerate(and_tokens):
+            tk, tn = f"tk{i}", f"tn{i}"
+            params[tk] = f"%{tok}%"
+            params[tn] = f"%{_normalize_code(tok)}%"
+            token_clauses.append(
+                f"(p.sku ILIKE :{tk} OR p.name ILIKE :{tk} OR p.codigo_pos ILIKE :{tk} "
+                f"OR p.marca ILIKE :{tk} OR c.name ILIKE :{tk} OR cp.name ILIKE :{tk} "
+                f"OR REPLACE(REPLACE(UPPER(p.sku),'-',''),' ','') LIKE :{tn} "
+                f"OR REPLACE(REPLACE(UPPER(COALESCE(p.codigo_pos,'')),'-',''),' ','') LIKE :{tn})"
+            )
+        token_and = " AND ".join(token_clauses)
+
+        if qn_full:
+            params["qnf"] = f"%{qn_full}%"
+            params["qne"] = qn_full
+            code_clause = ("REPLACE(REPLACE(UPPER(p.sku),'-',''),' ','') LIKE :qnf "
+                           "OR REPLACE(REPLACE(UPPER(COALESCE(p.codigo_pos,'')),'-',''),' ','') LIKE :qnf")
+            wheres.append(f"(({token_and}) OR ({code_clause}))")
+            # Relevancia: match exacto de código primero, luego código contiene, luego nombre.
+            order_by = ("(REPLACE(REPLACE(UPPER(p.sku),'-',''),' ','') = :qne) DESC, "
+                        "(REPLACE(REPLACE(UPPER(p.sku),'-',''),' ','') LIKE :qnf) DESC, p.name")
+        else:
+            wheres.append(f"({token_and})")
+
     if inp.get("marca"):
         wheres.append("UPPER(p.marca) ILIKE :marca")
         params["marca"] = f"%{inp['marca'].upper()}%"
     if inp.get("categoria"):
         wheres.append("(UPPER(c.name) ILIKE :cat OR UPPER(cp.name) ILIKE :cat)")
         params["cat"] = f"%{inp['categoria'].upper()}%"
+    if inp.get("precio") is not None:
+        # Precio público EXACTO (igualdad). Soporte explícito y limitado: no rangos.
+        try:
+            params["precio"] = float(inp["precio"])
+            wheres.append("p.precio_publico = :precio")
+        except (TypeError, ValueError):
+            pass
     if inp.get("sin_precio"):
         wheres.append("(p.precio_publico IS NULL OR p.precio_publico = 0)")
     if inp.get("sin_cat"):
         wheres.append("p.categoria_id IS NULL")
     limit = _clamp_limit(inp.get("limit"), default=20, maximum=30)
     rows = db.execute(text(f"""
-        SELECT p.sku, p.name, p.marca, p.precio_publico,
+        SELECT p.sku, p.name, p.marca, p.codigo_pos, p.precio_publico,
                COALESCE(c.name,'Sin categoría') AS categoria,
-               COALESCE(sv.stock_fisico,0) AS stock
+               COALESCE(sv.stock_fisico,0) AS stock_fisico,
+               COALESCE(sv.stock_pos,0)    AS stock_pos
         FROM productos p
         LEFT JOIN categoria c  ON c.id  = p.categoria_id
         LEFT JOIN categoria cp ON cp.id = c.parent_id
         LEFT JOIN v_stock_libros sv ON sv.product_id = p.id
         WHERE {' AND '.join(wheres)}
-        ORDER BY p.name LIMIT :lim
+        ORDER BY {order_by} LIMIT :lim
     """), {**params, "lim": limit}).mappings().all()
     return json.dumps([dict(r) for r in rows], default=str, ensure_ascii=False)
 
@@ -261,6 +330,23 @@ Reglas operativas:
 - Si el usuario pregunta en español, responde en español.
 - Las cantidades de unidades se expresan en piezas (PZA), pares (PAR), juegos (JGO) según el producto.
 - Para precios al cliente usa precio_publico. No uses price como precio de venta.
+- El inventario tiene DOS libros distintos: stock_fisico (existencia física real en tienda) y stock_pos (lo que el sistema POS/fiscal registra). Cuando informes existencias muestra AMBOS por separado y etiquétalos claramente (p. ej. "Físico: X · POS: Y"). NUNCA los sumes ni los presentes como un solo número, y no inventes stock: si un dato no está disponible, dilo.
+
+Formato de respuesta (el chat NO renderiza Markdown — usa SOLO texto plano):
+- No uses Markdown: nada de negritas con **, ni asteriscos, ni #, ni tablas, ni viñetas con * o -.
+- Para los datos de un producto usa líneas simples, una por campo:
+  SKU: ...
+  Nombre: ...
+  Marca: ...
+  Precio público: ...
+  Stock físico: ...
+  Stock POS: ...
+- Si listas varios productos, numéralos "1)", "2)" y separa cada uno con una línea en blanco.
+
+Búsqueda y resultados:
+- Si no hay coincidencia con lo que pidió el usuario, dilo claramente; no inventes candidatos.
+- No muestres productos "relacionados" ni alternativas si no son claramente relevantes a lo pedido; no rellenes la respuesta con resultados de relleno.
+- Si el usuario pidió un precio exacto y no hay productos con ese precio, responde que no hay ninguno con ese precio, sin proponer otros.
 """
 
 
