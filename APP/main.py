@@ -30,6 +30,8 @@ from APP.routers import (
     dashboard,
     clientes,
     facturas,
+    cobranza_manual,
+    conciliacion_cobranza,
     faltantes,
     compras,
     compras_xml,
@@ -60,6 +62,8 @@ app.include_router(categorias.router)
 app.include_router(dashboard.router)
 app.include_router(clientes.router)
 app.include_router(facturas.router)
+app.include_router(cobranza_manual.router)
+app.include_router(conciliacion_cobranza.router)
 app.include_router(faltantes.router)
 app.include_router(pagos_proveedor.router_reportes)
 app.include_router(pagos_proveedor.router)
