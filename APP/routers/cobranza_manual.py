@@ -370,6 +370,114 @@ def estado_cuenta_cliente(cliente_id: int, db: Session = Depends(get_db)):
 
 
 # ═══════════════════════════════════════════════════
+# 3c. COBRANZA REAL — LISTA CON SALDO (solo lectura, modelo 009/010)
+# ═══════════════════════════════════════════════════
+
+FILTROS_REAL = ("pendiente", "pagada", "revisar", "pos_pagado_real_pendiente")
+
+
+@router.get("/real")
+def list_cobranza_real(
+    filtro: str | None = Query(default=None, description=f"Uno de: {', '.join(FILTROS_REAL)}"),
+    q: str | None = Query(default=None),
+    cliente_id: int | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """Lista de relaciones de cobranza REAL con saldo derivado del ledger 009/010.
+
+    SOLO LECTURA. saldo_real = ΣCARGO − Σ(NOTA_CREDITO+AJUSTE) − Σpagos_reales.
+    El contexto POS (estado_pos_detectado) es informativo y NUNCA entra al saldo.
+    Las relaciones CANCELADA se excluyen (consistente con /estado-cuenta)."""
+    where = ["cm.estatus <> 'CANCELADA'"]
+    params: dict = {}
+
+    if filtro:
+        f = filtro.lower()
+        if f not in FILTROS_REAL:
+            raise HTTPException(status_code=400, detail=f"filtro debe ser uno de: {', '.join(FILTROS_REAL)}")
+        if f == "pendiente":
+            where.append("cm.estatus IN ('PENDIENTE', 'PARCIAL')")
+        elif f == "pagada":
+            where.append("cm.estatus = 'PAGADA'")
+        elif f == "revisar":
+            where.append("cm.estatus = 'REVISAR'")
+        elif f == "pos_pagado_real_pendiente":
+            where.append("COALESCE(ac.algun_pos_pagado, false) = true")
+            where.append("cm.estatus IN ('PENDIENTE', 'PARCIAL')")
+    if cliente_id:
+        where.append("cm.cliente_id = :cid")
+        params["cid"] = cliente_id
+    if q:
+        where.append("c.nombre ILIKE :q")
+        params["q"] = f"%{normalize_text(q)}%"
+
+    where_sql = "WHERE " + " AND ".join(where)
+
+    # Sub-agregados por relación (evita fan-out cargos × pagos).
+    base = f"""
+        FROM cobranza_manual cm
+        LEFT JOIN clientes c ON c.id = cm.cliente_id
+        LEFT JOIN (
+            SELECT cobranza_manual_id,
+                   SUM(importe) FILTER (WHERE tipo_movimiento = 'CARGO')                       AS cargos_brutos,
+                   SUM(importe) FILTER (WHERE tipo_movimiento IN ('NOTA_CREDITO', 'AJUSTE'))    AS creditos_ajustes,
+                   COUNT(*)     FILTER (WHERE tipo_movimiento = 'CARGO')                        AS total_cargos,
+                   bool_or(estado_pos_detectado = 'PAGADO_POS')                                 AS algun_pos_pagado,
+                   bool_or(estado_pos_detectado IN ('FACTURADO_POS', 'PAGADO_POS'))             AS algun_pos_facturado
+            FROM cobranza_manual_cargos GROUP BY cobranza_manual_id
+        ) ac ON ac.cobranza_manual_id = cm.id
+        LEFT JOIN (
+            SELECT cobranza_manual_id, SUM(monto) AS pagos_reales
+            FROM cobranza_manual_pagos GROUP BY cobranza_manual_id
+        ) ap ON ap.cobranza_manual_id = cm.id
+        {where_sql}
+    """
+
+    total = db.execute(text(f"SELECT COUNT(*) {base}"), params).scalar()
+
+    params["limit"] = page_size
+    params["offset"] = (page - 1) * page_size
+    rows = db.execute(text(f"""
+        SELECT cm.id AS relacion_id, cm.cliente_id, c.nombre AS cliente,
+               COALESCE(ac.cargos_brutos, 0)     AS cargos_brutos,
+               COALESCE(ac.creditos_ajustes, 0)  AS creditos_ajustes,
+               COALESCE(ap.pagos_reales, 0)      AS pagos_reales,
+               COALESCE(ac.cargos_brutos, 0)
+                 - COALESCE(ac.creditos_ajustes, 0)
+                 - COALESCE(ap.pagos_reales, 0)  AS saldo_real,
+               cm.estatus,
+               COALESCE(ac.total_cargos, 0)          AS total_cargos,
+               COALESCE(ac.algun_pos_pagado, false)  AS algun_pos_pagado,
+               COALESCE(ac.algun_pos_facturado, false) AS algun_pos_facturado,
+               (COALESCE(ac.algun_pos_pagado, false) AND cm.estatus IN ('PENDIENTE', 'PARCIAL'))
+                                                     AS flag_pos_pagado_real_pendiente
+        {base}
+        ORDER BY flag_pos_pagado_real_pendiente DESC, saldo_real DESC, cm.id DESC
+        LIMIT :limit OFFSET :offset
+    """), params).mappings().all()
+
+    items = [{
+        "relacion_id": r["relacion_id"],
+        "cliente_id": r["cliente_id"],
+        "cliente": r["cliente"],
+        "cargos_brutos": _f(r["cargos_brutos"]),
+        "creditos_ajustes": _f(r["creditos_ajustes"]),
+        "pagos_reales": _f(r["pagos_reales"]),
+        "saldo_real": _f(r["saldo_real"]),
+        "estatus": r["estatus"],
+        "total_cargos": int(r["total_cargos"] or 0),
+        "algun_pos_pagado": bool(r["algun_pos_pagado"]),
+        "algun_pos_facturado": bool(r["algun_pos_facturado"]),
+        "flag_pos_pagado_real_pendiente": bool(r["flag_pos_pagado_real_pendiente"]),
+    } for r in rows]
+
+    return {"items": items, "total": int(total or 0), "page": page, "page_size": page_size,
+            "filtro": filtro, "filtros_disponibles": list(FILTROS_REAL)}
+
+
+# ═══════════════════════════════════════════════════
 # 4. DETALLE + PAGOS  (después de rutas específicas)
 # ═══════════════════════════════════════════════════
 
