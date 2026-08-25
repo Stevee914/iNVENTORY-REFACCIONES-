@@ -27,6 +27,7 @@ router = APIRouter(prefix="/cobranza-manual", tags=["Ventas y Cobranza"])
 
 METODOS_PAGO = ("EFECTIVO", "TRANSFERENCIA", "CHEQUE", "TARJETA", "OTRO")
 ESTATUS_ACTIVOS_PENDIENTES = ("PENDIENTE", "PARCIAL")
+TIPOS_MOVIMIENTO = ("CARGO", "NOTA_CREDITO", "AJUSTE")  # ledger real (migración 010)
 TOL = 0.01  # tolerancia de centavos para comparaciones de saldo
 
 
@@ -55,10 +56,11 @@ class CobranzaUpdate(BaseModel):
 
 
 class CargoManualCreate(BaseModel):
-    numero_notas: int
+    numero_notas: int = 0                       # >0 para CARGO; >=0 para crédito/ajuste
     importe: float
     fecha_cargo: Optional[date] = None
     observaciones: Optional[str] = None
+    tipo_movimiento: Optional[str] = "CARGO"    # CARGO | NOTA_CREDITO | AJUSTE (migración 010)
 
 
 class PagoManualCreate(BaseModel):
@@ -98,6 +100,32 @@ def _f(value):
     if isinstance(value, Decimal):
         return float(value)
     return float(value)
+
+
+def _calc_estatus_real(importe_total, creditos, pagos, cancelada_at) -> str:
+    """Estatus real NETO (modelo 010): saldo_real = ΣCARGO − créditos − pagos.
+    PAGADA si saldo_real<=0; PARCIAL si hubo pagos o créditos con saldo>0;
+    PENDIENTE si nada se ha aplicado. POS jamás entra aquí."""
+    if cancelada_at is not None:
+        return "CANCELADA"
+    saldo = float(importe_total or 0) - float(creditos or 0) - float(pagos or 0)
+    if saldo <= TOL:
+        return "PAGADA"
+    if (float(pagos or 0) + float(creditos or 0)) > TOL:
+        return "PARCIAL"
+    return "PENDIENTE"
+
+
+def _creditos_pagos(db: Session, relacion_id: int):
+    """(creditos, pagos) actuales de una relación. creditos = NOTA_CREDITO + AJUSTE."""
+    creditos = db.execute(text("""
+        SELECT COALESCE(SUM(importe), 0) FROM cobranza_manual_cargos
+        WHERE cobranza_manual_id = :id AND tipo_movimiento IN ('NOTA_CREDITO', 'AJUSTE')
+    """), {"id": relacion_id}).scalar()
+    pagos = db.execute(text("""
+        SELECT COALESCE(SUM(monto), 0) FROM cobranza_manual_pagos WHERE cobranza_manual_id = :id
+    """), {"id": relacion_id}).scalar()
+    return float(creditos or 0), float(pagos or 0)
 
 
 # ═══════════════════════════════════════════════════
@@ -659,13 +687,19 @@ def _reload_item(db: Session, id: int) -> dict:
                cm.estatus, cm.posteriormente_facturada, cm.folio_factura_referencia,
                cm.observaciones, cm.cancelada_at, cm.created_at, cm.updated_at,
                COALESCE(pg.total_pagado, 0) AS total_pagado,
-               cm.importe_total - COALESCE(pg.total_pagado, 0) AS saldo_pendiente
+               cm.importe_total - COALESCE(cr.creditos, 0) - COALESCE(pg.total_pagado, 0) AS saldo_pendiente
         FROM cobranza_manual cm
         LEFT JOIN clientes c ON c.id = cm.cliente_id
         LEFT JOIN (
             SELECT cobranza_manual_id, SUM(monto) AS total_pagado
             FROM cobranza_manual_pagos GROUP BY cobranza_manual_id
         ) pg ON pg.cobranza_manual_id = cm.id
+        LEFT JOIN (
+            SELECT cobranza_manual_id, SUM(importe) AS creditos
+            FROM cobranza_manual_cargos
+            WHERE tipo_movimiento IN ('NOTA_CREDITO', 'AJUSTE')
+            GROUP BY cobranza_manual_id
+        ) cr ON cr.cobranza_manual_id = cm.id
         WHERE cm.id = :id
     """), {"id": id}).mappings().first()
     return _row_to_item(row)
@@ -703,15 +737,13 @@ def create_pago_manual(id: int, payload: PagoManualCreate, db: Session = Depends
             db.rollback()
             raise HTTPException(status_code=409, detail="La relación ya está PAGADA; no admite más abonos")
 
-        # (c) Validar que el monto no supere el saldo pendiente (tolerancia 0.01).
-        total_pagado = db.execute(
-            text("SELECT COALESCE(SUM(monto), 0) FROM cobranza_manual_pagos WHERE cobranza_manual_id = :id"),
-            {"id": id},
-        ).scalar()
-        saldo = float(rel["importe_total"]) - float(total_pagado)
+        # (c) Validar que el monto no supere el SALDO REAL (neto de créditos).
+        #     Un pago no puede dejar saldo_real < 0.
+        creditos, total_pagado = _creditos_pagos(db, id)
+        saldo = float(rel["importe_total"]) - creditos - float(total_pagado)
         if payload.monto > saldo + TOL:
             db.rollback()
-            raise HTTPException(status_code=400, detail=f"El abono excede el saldo pendiente (${saldo:.2f})")
+            raise HTTPException(status_code=400, detail=f"El pago excede el saldo real pendiente (${saldo:.2f})")
 
         # (e) Insertar el pago.
         pago = db.execute(text("""
@@ -730,9 +762,9 @@ def create_pago_manual(id: int, payload: PagoManualCreate, db: Session = Depends
             "obs": normalize_text(payload.observaciones) or None,
         }).mappings().one()
 
-        # (f) Recalcular estatus + updated_at.
+        # (f) Recalcular estatus REAL (neto de créditos) + updated_at.
         nuevo_total = float(total_pagado) + float(payload.monto)
-        nuevo_estatus = _calc_estatus(rel["importe_total"], nuevo_total, None)
+        nuevo_estatus = _calc_estatus_real(rel["importe_total"], creditos, nuevo_total, None)
         db.execute(text("""
             UPDATE cobranza_manual SET estatus = :est, updated_at = now() WHERE id = :id
         """), {"est": nuevo_estatus, "id": id})
@@ -793,15 +825,26 @@ def list_pagos_manual(id: int, db: Session = Depends(get_db)):
 
 @router.post("/{id}/cargos")
 def create_cargo_manual(id: int, payload: CargoManualCreate, db: Session = Depends(get_db)):
-    """Agrega un cargo a la relación (suma a la cuenta). Los acumulados
-    importe_total/numero_notas de la relación se incrementan en la MISMA
-    transacción. Un cargo puede REABRIR una relación PAGADA (vuelve a
-    PARCIAL/PENDIENTE). No se permite en relaciones CANCELADA."""
+    """Agrega un MOVIMIENTO al ledger real de la relación (migración 010):
+      - CARGO (+): suma a la cuenta; incrementa los acumulados importe_total/numero_notas
+        y puede REABRIR una relación PAGADA.
+      - NOTA_CREDITO / AJUSTE (−): bajan el saldo real (crédito fiscal / ajuste a favor);
+        NO incrementan los acumulados brutos y NO pueden exceder el saldo real pendiente
+        (regla dura: no se permite saldo_real < 0).
+    Todo en una transacción con lock. POS es solo contexto: este endpoint NO lo toca.
+    No se permite en relaciones CANCELADA."""
     # Validaciones de entrada (fuera de la transacción crítica).
-    if payload.numero_notas is None or payload.numero_notas <= 0:
-        raise HTTPException(status_code=400, detail="numero_notas debe ser mayor a 0")
+    tipo = (payload.tipo_movimiento or "CARGO").upper()
+    if tipo not in TIPOS_MOVIMIENTO:
+        raise HTTPException(status_code=400, detail=f"tipo_movimiento debe ser: {', '.join(TIPOS_MOVIMIENTO)}")
     if payload.importe is None or payload.importe <= 0:
         raise HTTPException(status_code=400, detail="importe debe ser mayor a 0")
+    numero_notas = int(payload.numero_notas or 0)
+    if tipo == "CARGO":
+        if numero_notas <= 0:
+            raise HTTPException(status_code=400, detail="numero_notas debe ser mayor a 0 para un CARGO")
+    elif numero_notas < 0:
+        raise HTTPException(status_code=400, detail="numero_notas no puede ser negativo")
 
     try:
         # (a) Bloquear la relación FOR UPDATE.
@@ -817,47 +860,53 @@ def create_cargo_manual(id: int, payload: CargoManualCreate, db: Session = Depen
         # (b) Rechazar si está CANCELADA.
         if rel["estatus"] == "CANCELADA" or rel["cancelada_at"] is not None:
             db.rollback()
-            raise HTTPException(status_code=409, detail="No se pueden agregar cargos a una relación CANCELADA")
+            raise HTTPException(status_code=409, detail="No se pueden agregar movimientos a una relación CANCELADA")
 
+        # (c) Saldo real actual (neto de créditos y pagos).
+        creditos, pagos = _creditos_pagos(db, id)
+        saldo_real = float(rel["importe_total"]) - creditos - pagos
+
+        # (d) Regla dura: un crédito/ajuste NO puede dejar el saldo real negativo.
+        if tipo != "CARGO" and float(payload.importe) > saldo_real + TOL:
+            db.rollback()
+            raise HTTPException(status_code=409, detail=(
+                f"La {tipo} (${float(payload.importe):.2f}) excede el saldo real pendiente "
+                f"(${saldo_real:.2f}); dejaría el saldo en negativo."))
+
+        # (e) Insertar el movimiento (origen MANUAL, tipo según payload).
         fecha = payload.fecha_cargo or date.today()
-
-        # (c) Insertar el cargo (origen MANUAL).
         cargo = db.execute(text("""
             INSERT INTO cobranza_manual_cargos
-                (cobranza_manual_id, fecha_cargo, numero_notas, importe, origen, observaciones)
+                (cobranza_manual_id, fecha_cargo, numero_notas, importe, origen,
+                 tipo_movimiento, observaciones)
             VALUES
-                (:cmid, :fecha, :notas, :importe, 'MANUAL', :obs)
+                (:cmid, :fecha, :notas, :importe, 'MANUAL', :tipo, :obs)
             RETURNING id, cobranza_manual_id, fecha_cargo, numero_notas, importe,
-                      origen, observaciones, created_at
+                      origen, tipo_movimiento, observaciones, created_at
         """), {
-            "cmid": id,
-            "fecha": fecha,
-            "notas": payload.numero_notas,
-            "importe": payload.importe,
-            "obs": normalize_text(payload.observaciones) or None,
+            "cmid": id, "fecha": fecha, "notas": numero_notas, "importe": payload.importe,
+            "tipo": tipo, "obs": normalize_text(payload.observaciones) or None,
         }).mappings().one()
 
-        # (d) Incrementar los acumulados de la relación.
-        nuevo_importe_total = float(rel["importe_total"]) + float(payload.importe)
-        nuevo_numero_notas = int(rel["numero_notas"]) + int(payload.numero_notas)
+        # (f) Actualizar acumulados y estatus. Solo CARGO mueve los brutos.
+        if tipo == "CARGO":
+            nuevo_importe_total = float(rel["importe_total"]) + float(payload.importe)
+            nuevo_numero_notas = int(rel["numero_notas"]) + numero_notas
+            nuevos_creditos = creditos
+        else:
+            nuevo_importe_total = float(rel["importe_total"])
+            nuevo_numero_notas = int(rel["numero_notas"])
+            nuevos_creditos = creditos + float(payload.importe)
 
-        # (e) Recalcular estatus con el total pagado actual (puede reabrir una PAGADA).
-        total_pagado = db.execute(
-            text("SELECT COALESCE(SUM(monto), 0) FROM cobranza_manual_pagos WHERE cobranza_manual_id = :id"),
-            {"id": id},
-        ).scalar()
-        nuevo_estatus = _calc_estatus(nuevo_importe_total, float(total_pagado), None)
-
+        nuevo_estatus = _calc_estatus_real(nuevo_importe_total, nuevos_creditos, pagos, None)
         db.execute(text("""
             UPDATE cobranza_manual
             SET importe_total = :importe, numero_notas = :notas,
                 estatus = :est, updated_at = now()
             WHERE id = :id
         """), {
-            "importe": nuevo_importe_total,
-            "notas": nuevo_numero_notas,
-            "est": nuevo_estatus,
-            "id": id,
+            "importe": nuevo_importe_total, "notas": nuevo_numero_notas,
+            "est": nuevo_estatus, "id": id,
         })
 
         db.commit()
@@ -874,6 +923,7 @@ def create_cargo_manual(id: int, payload: CargoManualCreate, db: Session = Depen
         "numero_notas": cargo["numero_notas"],
         "importe": _f(cargo["importe"]),
         "origen": cargo["origen"],
+        "tipo_movimiento": cargo["tipo_movimiento"],
         "observaciones": cargo["observaciones"],
         "created_at": cargo["created_at"],
     }
@@ -887,7 +937,7 @@ def list_cargos_manual(id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Relación de cobranza no encontrada")
     rows = db.execute(text("""
         SELECT id, cobranza_manual_id, fecha_cargo, numero_notas, importe,
-               origen, observaciones, created_at
+               origen, tipo_movimiento, observaciones, created_at
         FROM cobranza_manual_cargos
         WHERE cobranza_manual_id = :id
         ORDER BY fecha_cargo ASC, id ASC
@@ -899,6 +949,7 @@ def list_cargos_manual(id: int, db: Session = Depends(get_db)):
         "numero_notas": r["numero_notas"],
         "importe": _f(r["importe"]),
         "origen": r["origen"],
+        "tipo_movimiento": r["tipo_movimiento"],
         "observaciones": r["observaciones"],
         "created_at": r["created_at"],
     } for r in rows]
