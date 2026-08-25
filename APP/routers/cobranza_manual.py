@@ -61,6 +61,7 @@ class CargoManualCreate(BaseModel):
     fecha_cargo: Optional[date] = None
     observaciones: Optional[str] = None
     tipo_movimiento: Optional[str] = "CARGO"    # CARGO | NOTA_CREDITO | AJUSTE (migración 010)
+    factura_pos_folio: Optional[str] = None     # folio(s) de factura (contexto), individual o rango
 
 
 class PagoManualCreate(BaseModel):
@@ -69,6 +70,7 @@ class PagoManualCreate(BaseModel):
     fecha_pago: Optional[date] = None
     referencia: Optional[str] = None
     observaciones: Optional[str] = None
+    cargo_id: Optional[int] = None              # factura/cargo que paga (opcional; migración 011)
 
 
 class CancelacionBody(BaseModel):
@@ -745,20 +747,30 @@ def create_pago_manual(id: int, payload: PagoManualCreate, db: Session = Depends
             db.rollback()
             raise HTTPException(status_code=400, detail=f"El pago excede el saldo real pendiente (${saldo:.2f})")
 
+        # (c2) Si se indica una factura (cargo), validar que sea de ESTA relación.
+        if payload.cargo_id is not None:
+            pertenece = db.execute(text(
+                "SELECT 1 FROM cobranza_manual_cargos WHERE id = :cg AND cobranza_manual_id = :id"
+            ), {"cg": payload.cargo_id, "id": id}).first()
+            if not pertenece:
+                db.rollback()
+                raise HTTPException(status_code=400, detail="La factura seleccionada no pertenece a esta relación")
+
         # (e) Insertar el pago.
         pago = db.execute(text("""
             INSERT INTO cobranza_manual_pagos
-                (cobranza_manual_id, fecha_pago, monto, metodo_pago, referencia, observaciones)
+                (cobranza_manual_id, fecha_pago, monto, metodo_pago, referencia, cargo_id, observaciones)
             VALUES
-                (:id, :fecha, :monto, :metodo, :ref, :obs)
+                (:id, :fecha, :monto, :metodo, :ref, :cargo_id, :obs)
             RETURNING id, cobranza_manual_id, fecha_pago, monto, metodo_pago,
-                      referencia, observaciones, created_at
+                      referencia, cargo_id, observaciones, created_at
         """), {
             "id": id,
             "fecha": payload.fecha_pago or date.today(),
             "monto": payload.monto,
             "metodo": metodo,
             "ref": normalize_text(payload.referencia) or None,
+            "cargo_id": payload.cargo_id,
             "obs": normalize_text(payload.observaciones) or None,
         }).mappings().one()
 
@@ -784,6 +796,7 @@ def create_pago_manual(id: int, payload: PagoManualCreate, db: Session = Depends
         "monto": _f(pago["monto"]),
         "metodo_pago": pago["metodo_pago"],
         "referencia": pago["referencia"],
+        "cargo_id": pago["cargo_id"],
         "observaciones": pago["observaciones"],
         "created_at": pago["created_at"],
     }
@@ -801,7 +814,7 @@ def list_pagos_manual(id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Relación de cobranza no encontrada")
     rows = db.execute(text("""
         SELECT id, cobranza_manual_id, fecha_pago, monto, metodo_pago,
-               referencia, observaciones, created_at
+               referencia, cargo_id, observaciones, created_at
         FROM cobranza_manual_pagos
         WHERE cobranza_manual_id = :id
         ORDER BY fecha_pago DESC, id DESC
@@ -813,6 +826,7 @@ def list_pagos_manual(id: int, db: Session = Depends(get_db)):
         "monto": _f(r["monto"]),
         "metodo_pago": r["metodo_pago"],
         "referencia": r["referencia"],
+        "cargo_id": r["cargo_id"],
         "observaciones": r["observaciones"],
         "created_at": r["created_at"],
     } for r in rows]
@@ -875,17 +889,19 @@ def create_cargo_manual(id: int, payload: CargoManualCreate, db: Session = Depen
 
         # (e) Insertar el movimiento (origen MANUAL, tipo según payload).
         fecha = payload.fecha_cargo or date.today()
+        # Folio de factura solo aplica a CARGO (contexto). Crédito/ajuste sin folio.
+        folio = (normalize_text(payload.factura_pos_folio) or None) if tipo == "CARGO" else None
         cargo = db.execute(text("""
             INSERT INTO cobranza_manual_cargos
                 (cobranza_manual_id, fecha_cargo, numero_notas, importe, origen,
-                 tipo_movimiento, observaciones)
+                 tipo_movimiento, factura_pos_folio, observaciones)
             VALUES
-                (:cmid, :fecha, :notas, :importe, 'MANUAL', :tipo, :obs)
+                (:cmid, :fecha, :notas, :importe, 'MANUAL', :tipo, :folio, :obs)
             RETURNING id, cobranza_manual_id, fecha_cargo, numero_notas, importe,
-                      origen, tipo_movimiento, observaciones, created_at
+                      origen, tipo_movimiento, factura_pos_folio, observaciones, created_at
         """), {
             "cmid": id, "fecha": fecha, "notas": numero_notas, "importe": payload.importe,
-            "tipo": tipo, "obs": normalize_text(payload.observaciones) or None,
+            "tipo": tipo, "folio": folio, "obs": normalize_text(payload.observaciones) or None,
         }).mappings().one()
 
         # (f) Actualizar acumulados y estatus. Solo CARGO mueve los brutos.
@@ -924,6 +940,7 @@ def create_cargo_manual(id: int, payload: CargoManualCreate, db: Session = Depen
         "importe": _f(cargo["importe"]),
         "origen": cargo["origen"],
         "tipo_movimiento": cargo["tipo_movimiento"],
+        "factura_pos_folio": cargo["factura_pos_folio"],
         "observaciones": cargo["observaciones"],
         "created_at": cargo["created_at"],
     }
@@ -937,7 +954,7 @@ def list_cargos_manual(id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Relación de cobranza no encontrada")
     rows = db.execute(text("""
         SELECT id, cobranza_manual_id, fecha_cargo, numero_notas, importe,
-               origen, tipo_movimiento, observaciones, created_at
+               origen, tipo_movimiento, factura_pos_folio, observaciones, created_at
         FROM cobranza_manual_cargos
         WHERE cobranza_manual_id = :id
         ORDER BY fecha_cargo ASC, id ASC
@@ -950,6 +967,7 @@ def list_cargos_manual(id: int, db: Session = Depends(get_db)):
         "importe": _f(r["importe"]),
         "origen": r["origen"],
         "tipo_movimiento": r["tipo_movimiento"],
+        "factura_pos_folio": r["factura_pos_folio"],
         "observaciones": r["observaciones"],
         "created_at": r["created_at"],
     } for r in rows]
